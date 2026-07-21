@@ -5,10 +5,10 @@ import subprocess
 
 
 sw_list=[0,1,2]
-Prob_list=[0.1,1]
+Prob_list=[0,0.01,0.1,1]
 dem=1.0
 lm=1
-lc=0
+lc=19
 
 
 # Directory to save the generated scripts
@@ -23,7 +23,6 @@ for sw in sw_list:
 
 from sc_substation_reconfiguration.original_MIP_model import *
 from sc_substation_reconfiguration.hmmp import *
-from sc_substation_reconfiguration.hmmp_optimality import *
                                                     
 data_file = './IEEE_14_bus_Data_CongestionEq.xlsx'
 
@@ -40,13 +39,13 @@ print('busbar prob is:',{prob})
 data=read_data_AC(File=data_file,DemFactor={dem},LineLimit=lm,busbar_prob={prob},print_data=False)
 
 coupler_cont=data['coupler_cont']; busbar_cont = data['busbar_cont']
-line_cont = [] #data['line_cont_notradial']
+line_cont = data['line_cont_notradial']
 lc = len(line_cont)
 
 
 # #Proposed
 
-res = BCC_v61_AC_MultiBenders_Main(data,line_cont_list=line_cont,Max_Sw_bus={sw},
+res = SC_SR_HMMP(data,line_cont_list=line_cont,Max_Sw_bus={sw},
                                 Probabilistic=True,
                                 Max_iter=10,Max_FSP_iter=0,FSP_criteria=0,OSP_criteria=1)
 
@@ -59,24 +58,9 @@ with open(File_name, 'wb') as f:
 
 
 
-# %%
-
-res = BCC_v66_AC_MultiBenders_OptimalSplit(data,line_cont_list=line_cont,
-                                Probabilistic=True,
-                                Max_iter=10,Max_FSP_iter=0,FSP_criteria=0,OSP_criteria=1,
-                                Max_Sw_bus={sw})
-
-
-File_name = f'Results/Case2.3/CaseStudy2.3_{prob}Prob_Proposed_new_14busCongEq_{sw}sw_{dem}dem_{lm}line_{lc}lc.pkl'
-
-with open(File_name, 'wb') as f:
-    pickle.dump(res, f)
-
-
-
 #CO
 
-res = BCC_v60_AC_full(data=data,
+res = SC_SR_OrgMIP(data=data,
                         cont_list=line_cont +busbar_cont+coupler_cont,
                         Zfixdict=None,
                         Probabilistic=True,

@@ -4,7 +4,7 @@ This script includes two models: BD-C, which uses classical Benders cuts, and
 BD-H, which uses heuristic cuts.
 
 Select the cut strategy through the ``heuristic_cut`` input of
-``BCC_Benders_Classic_AC_v62``: set it to ``False`` for BD-C or ``True`` for
+``SC_SR_Benders``: set it to ``False`` for BD-C or ``True`` for
 BD-H.
 
 The master problem selects topology and normal dispatch, while feasibility and
@@ -27,9 +27,27 @@ from .original_MIP_model import *  # Shared data preparation and AC-OPF utilitie
 # Originally tested with Python 3.7 and Gurobi 9.0.
 
 
-def create_FSP_line_v62(
+def _extract_linearization_points(model, Lines, cont_list):
+    """Extract branch-voltage and angle linearization points from a solution."""
+    Vol0_li = {}
+    delta0_li = {}
+    for l,i,j in Lines:
+        for c in cont_list:
+            suffix = f'[{l},{i},{j},{c}]'
+            Vol0_li[l,i,j,c] = np.sqrt(
+                model.getVarByName('V2_li' + suffix).x
+            )
+            delta0_li[l,i,j,c] = model.getVarByName(
+                'delta_li' + suffix
+            ).x
+    return Vol0_li, delta0_li
+
+
+def create_benders_line_fsp(
     data,
     cont_list=None,
+    Vol0_li=None,
+    delta0_li=None,
 ):
     """Build the line-contingency feasibility subproblem (FSP).
 
@@ -41,6 +59,10 @@ def create_FSP_line_v62(
         data: Network and model-parameter dictionary returned by
             ``read_data_AC``.
         cont_list: Line-contingency identifiers represented in the model.
+        Vol0_li: Optional branch-voltage linearization points; unit values are
+            used when omitted.
+        delta0_li: Optional branch-angle linearization points; zero values are
+            used when omitted.
 
     Returns:
         A dictionary containing the unsolved Gurobi ``model`` and its binary,
@@ -79,6 +101,11 @@ def create_FSP_line_v62(
     model=gp.Model('BCC Benders FSP-1')
     
     cont_list=cont_list.copy()   
+
+    if Vol0_li is None:
+        Vol0_li={(l,i,j,c):1.0 for l,i,j in Lines for c in cont_list}
+    if delta0_li is None:
+        delta0_li={(l,i,j,c):0.0 for l,i,j in Lines for c in cont_list}
         
    
     model.Params.OutputFlag=0
@@ -99,15 +126,22 @@ def create_FSP_line_v62(
     Pflow_li=model.addVars(Lines,busbar,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Pflow_li')
     Qflow=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qflow')         
     Qflow_li=model.addVars(Lines,busbar,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qflow_li')
+    Ploss=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Ploss')
+    Qloss=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qloss')
+    Ploss_vol=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Ploss_vol')
+    Qloss_vol=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qloss_vol')
+    Ploss_delta=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Ploss_delta')
+    Qloss_delta=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qloss_delta')
+    epsilon=model.addVars(Lines,cont_list,lb=0,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='epsilon')
     
     Pflow_bus=model.addVars(Bus,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Pflow_bus')  #From b1 to b2!
     Qflow_bus=model.addVars(Bus,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qflow_bus')  #From b1 to b2!
 
     
     delta_bi=model.addVars(Bus,busbar,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='delta_bi') 
-    delta_li=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='delta_le') 
+    delta_li=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='delta_li')
     V2_bi=model.addVars(Bus,busbar,cont_list,lb=0,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='delta_bi') 
-    V2_li=model.addVars(Lines,cont_list,lb=0,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='delta_le') 
+    V2_li=model.addVars(Lines,cont_list,lb=0,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='V2_li')
 
 
     z_bus=model.addVars(Bus,lb=0,ub=1,vtype=GRB.CONTINUOUS,name='z_bus')    
@@ -225,17 +259,39 @@ def create_FSP_line_v62(
 
     model.addConstrs( (  Pflow[l,i,j,c] == 
     0.5*branch.loc[(l,i,j)]['g_ij']*( V2_li[l,i,j,c] - V2_li[l,j,i,c] )
-    -branch.loc[(l,i,j)]['b_ij']*(delta_li[l,i,j,c]-delta_li[l,j,i,c]) #+ Ploss[l,i,j,c]
+    -branch.loc[(l,i,j)]['b_ij']*(delta_li[l,i,j,c]-delta_li[l,j,i,c]) + Ploss[l,i,j,c]
                             for l,i,j in Lines
                            for c in cont_list if l!=c   ) , name='eqPij')
     
     model.addConstrs( (  Qflow[l,i,j,c] == 
     -0.5*branch.loc[(l,i,j)]['b_ij']*(V2_li[l,i,j,c] - V2_li[l,j,i,c])
-    -branch.loc[(l,i,j)]['g_ij']*(delta_li[l,i,j,c]-delta_li[l,j,i,c]) 
+    -branch.loc[(l,i,j)]['g_ij']*(delta_li[l,i,j,c]-delta_li[l,j,i,c]) + Qloss[l,i,j,c]
                             for l,i,j in Lines
                            for c in cont_list if l!=c    ) , name='eqQij')
     
-    # Branch losses
+    # Linearized branch-loss equations
+    model.addConstrs((Ploss[l,i,j,c] == Ploss_vol[l,i,j,c] + Ploss_delta[l,i,j,c]
+                      for l,i,j in Lines for c in cont_list if l!=c), name='eqPloss_total')
+    model.addConstrs((Qloss[l,i,j,c] == Qloss_vol[l,i,j,c] + Qloss_delta[l,i,j,c]
+                      for l,i,j in Lines for c in cont_list if l!=c), name='eqQloss_total')
+    model.addConstrs((0 <= Ploss[l,i,j,c] + epsilon[l,i,j,c]
+                      for l,i,j in Lines for c in cont_list if l!=c), name='eqPloss_pos')
+    model.addConstrs((Ploss_vol[l,i,j,c] ==
+                      branch.loc[(l,i,j)]['g_ij']*((Vol0_li[l,i,j,c]-Vol0_li[l,j,i,c])/(Vol0_li[l,i,j,c]+Vol0_li[l,j,i,c]))*(V2_li[l,i,j,c]-V2_li[l,j,i,c])
+                      -0.5*branch.loc[(l,i,j)]['g_ij']*(Vol0_li[l,i,j,c]-Vol0_li[l,j,i,c])**2
+                      for l,i,j in Lines for c in cont_list if l!=c), name='eqPloss_vol')
+    model.addConstrs((Qloss_vol[l,i,j,c] ==
+                      -branch.loc[(l,i,j)]['b_ij']*((Vol0_li[l,i,j,c]-Vol0_li[l,j,i,c])/(Vol0_li[l,i,j,c]+Vol0_li[l,j,i,c]))*(V2_li[l,i,j,c]-V2_li[l,j,i,c])
+                      +0.5*branch.loc[(l,i,j)]['b_ij']*(Vol0_li[l,i,j,c]-Vol0_li[l,j,i,c])**2
+                      for l,i,j in Lines for c in cont_list if l!=c), name='eqQloss_vol')
+    model.addConstrs((Ploss_delta[l,i,j,c] ==
+                      branch.loc[(l,i,j)]['g_ij']*(delta0_li[l,i,j,c]-delta0_li[l,j,i,c])*(delta_li[l,i,j,c]-delta_li[l,j,i,c])
+                      -0.5*branch.loc[(l,i,j)]['g_ij']*(delta0_li[l,i,j,c]-delta0_li[l,j,i,c])**2
+                      for l,i,j in Lines for c in cont_list if l!=c), name='eqPloss_delta')
+    model.addConstrs((Qloss_delta[l,i,j,c] ==
+                      -branch.loc[(l,i,j)]['b_ij']*(delta0_li[l,i,j,c]-delta0_li[l,j,i,c])*(delta_li[l,i,j,c]-delta_li[l,j,i,c])
+                      +0.5*branch.loc[(l,i,j)]['b_ij']*(delta0_li[l,i,j,c]-delta0_li[l,j,i,c])**2
+                      for l,i,j in Lines for c in cont_list if l!=c), name='eqQloss_delta')
 
 
     # Voltage magnitude
@@ -359,10 +415,11 @@ def create_FSP_line_v62(
             }
     
     
-def solve_FSP_line_v62(
+def solve_benders_line_fsp(
     data,
     TopologyMP,
     model0,
+    cont_list=None,
     print_result=False,
 ):
     """Solve a prepared FSP for a topology proposed by the master problem.
@@ -372,12 +429,13 @@ def solve_FSP_line_v62(
             ``read_data_AC``.
         TopologyMP: Master-problem topology and dispatch values to impose on
             the subproblem.
-        model0: Unsolved FSP model created by ``create_FSP_line_v62``.
+        model0: Unsolved FSP model created by ``create_benders_line_fsp``.
+        cont_list: Line-contingency identifiers represented by ``model0``.
         print_result: Print the feasibility objective when ``True``.
 
     Returns:
         A dictionary containing linking-constraint duals (``Mu``), solve time,
-        and the FSP objective value (``OF_FSP``).
+        the FSP objective value, and updated linearization points.
     """
     
     
@@ -495,20 +553,30 @@ def solve_FSP_line_v62(
         print(model.getVarByName('OF_FSP').x)
         
     
+    Vol0_li, delta0_li = _extract_linearization_points(
+        model,
+        Lines,
+        cont_list,
+    )
+
     # Results
     return { 
         'Mu':Mu,
         'time':ex_time,
-        'OF_FSP': model.getVarByName('OF_FSP').x         
+        'OF_FSP': model.getVarByName('OF_FSP').x,
+        'Vol0_li':Vol0_li,
+        'delta0_li':delta0_li
     }
     
     
-def create_OSP_substation_v62(
+def create_benders_substation_osp(
     data,
     cont_list=None,
     Up_redispatch=0,
     Dn_redispatch=1.0,
     Max_Sw_bus=0,
+    Vol0_li=None,
+    delta0_li=None,
 ):
     """Build the contingency optimality subproblem (OSP).
 
@@ -522,6 +590,10 @@ def create_OSP_substation_v62(
         Dn_redispatch: Fraction of generator capacity available for downward
             active-power redispatch.
         Max_Sw_bus: Maximum number of busbar-splitting actions allowed.
+        Vol0_li: Optional branch-voltage linearization points; unit values are
+            used when omitted.
+        delta0_li: Optional branch-angle linearization points; zero values are
+            used when omitted.
 
     Returns:
         A dictionary containing the unsolved Gurobi ``model`` and its binary,
@@ -560,6 +632,10 @@ def create_OSP_substation_v62(
     model=gp.Model('BCC Benders Optimality-SP')
     
     cont_list=cont_list.copy()   
+    if Vol0_li is None:
+        Vol0_li={(l,i,j,c):1.0 for l,i,j in Lines for c in cont_list}
+    if delta0_li is None:
+        delta0_li={(l,i,j,c):0.0 for l,i,j in Lines for c in cont_list}
     model.Params.OutputFlag=0
 
 
@@ -587,14 +663,21 @@ def create_OSP_substation_v62(
     Pflow_li=model.addVars(Lines,busbar,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Pflow_li')
     Qflow=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qflow')         
     Qflow_li=model.addVars(Lines,busbar,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qflow_li')
+    Ploss=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Ploss')
+    Qloss=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qloss')
+    Ploss_vol=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Ploss_vol')
+    Qloss_vol=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qloss_vol')
+    Ploss_delta=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Ploss_delta')
+    Qloss_delta=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qloss_delta')
+    epsilon=model.addVars(Lines,cont_list,lb=0,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='epsilon')
     
     Pflow_bus=model.addVars(Bus,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Pflow_bus')  #From b1 to b2!
     Qflow_bus=model.addVars(Bus,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qflow_bus')  #From b1 to b2!
     
     delta_bi=model.addVars(Bus,busbar,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='delta_bi') 
-    delta_li=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='delta_le') 
+    delta_li=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='delta_li')
     V2_bi=model.addVars(Bus,busbar,cont_list,lb=0,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='delta_bi') 
-    V2_li=model.addVars(Lines,cont_list,lb=0,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='delta_le') 
+    V2_li=model.addVars(Lines,cont_list,lb=0,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='V2_li')
 
 
     z_bus=model.addVars(Bus,lb=0,ub=1,vtype=GRB.CONTINUOUS,name='z_bus')    
@@ -773,17 +856,39 @@ def create_OSP_substation_v62(
 
     model.addConstrs( (  Pflow[l,i,j,c] == 
     0.5*branch.loc[(l,i,j)]['g_ij']*( V2_li[l,i,j,c] - V2_li[l,j,i,c] )
-    -branch.loc[(l,i,j)]['b_ij']*(delta_li[l,i,j,c]-delta_li[l,j,i,c]) #+ Ploss[l,i,j,c]
+    -branch.loc[(l,i,j)]['b_ij']*(delta_li[l,i,j,c]-delta_li[l,j,i,c]) + Ploss[l,i,j,c]
                             for l,i,j in Lines
                            for c in cont_list if l!=c   ) , name='eqPij')
     
     model.addConstrs( (  Qflow[l,i,j,c] == 
     -0.5*branch.loc[(l,i,j)]['b_ij']*(V2_li[l,i,j,c] - V2_li[l,j,i,c])
-    -branch.loc[(l,i,j)]['g_ij']*(delta_li[l,i,j,c]-delta_li[l,j,i,c]) 
+    -branch.loc[(l,i,j)]['g_ij']*(delta_li[l,i,j,c]-delta_li[l,j,i,c]) + Qloss[l,i,j,c]
                             for l,i,j in Lines
                            for c in cont_list if l!=c    ) , name='eqQij')
     
-    # Branch losses
+    # Linearized branch-loss equations
+    model.addConstrs((Ploss[l,i,j,c] == Ploss_vol[l,i,j,c] + Ploss_delta[l,i,j,c]
+                      for l,i,j in Lines for c in cont_list if l!=c), name='eqPloss_total')
+    model.addConstrs((Qloss[l,i,j,c] == Qloss_vol[l,i,j,c] + Qloss_delta[l,i,j,c]
+                      for l,i,j in Lines for c in cont_list if l!=c), name='eqQloss_total')
+    model.addConstrs((0 <= Ploss[l,i,j,c] + epsilon[l,i,j,c]
+                      for l,i,j in Lines for c in cont_list if l!=c), name='eqPloss_pos')
+    model.addConstrs((Ploss_vol[l,i,j,c] ==
+                      branch.loc[(l,i,j)]['g_ij']*((Vol0_li[l,i,j,c]-Vol0_li[l,j,i,c])/(Vol0_li[l,i,j,c]+Vol0_li[l,j,i,c]))*(V2_li[l,i,j,c]-V2_li[l,j,i,c])
+                      -0.5*branch.loc[(l,i,j)]['g_ij']*(Vol0_li[l,i,j,c]-Vol0_li[l,j,i,c])**2
+                      for l,i,j in Lines for c in cont_list if l!=c), name='eqPloss_vol')
+    model.addConstrs((Qloss_vol[l,i,j,c] ==
+                      -branch.loc[(l,i,j)]['b_ij']*((Vol0_li[l,i,j,c]-Vol0_li[l,j,i,c])/(Vol0_li[l,i,j,c]+Vol0_li[l,j,i,c]))*(V2_li[l,i,j,c]-V2_li[l,j,i,c])
+                      +0.5*branch.loc[(l,i,j)]['b_ij']*(Vol0_li[l,i,j,c]-Vol0_li[l,j,i,c])**2
+                      for l,i,j in Lines for c in cont_list if l!=c), name='eqQloss_vol')
+    model.addConstrs((Ploss_delta[l,i,j,c] ==
+                      branch.loc[(l,i,j)]['g_ij']*(delta0_li[l,i,j,c]-delta0_li[l,j,i,c])*(delta_li[l,i,j,c]-delta_li[l,j,i,c])
+                      -0.5*branch.loc[(l,i,j)]['g_ij']*(delta0_li[l,i,j,c]-delta0_li[l,j,i,c])**2
+                      for l,i,j in Lines for c in cont_list if l!=c), name='eqPloss_delta')
+    model.addConstrs((Qloss_delta[l,i,j,c] ==
+                      -branch.loc[(l,i,j)]['b_ij']*(delta0_li[l,i,j,c]-delta0_li[l,j,i,c])*(delta_li[l,i,j,c]-delta_li[l,j,i,c])
+                      +0.5*branch.loc[(l,i,j)]['b_ij']*(delta0_li[l,i,j,c]-delta0_li[l,j,i,c])**2
+                      for l,i,j in Lines for c in cont_list if l!=c), name='eqQloss_delta')
 
  
     model.addConstrs( ( V2_bi[b,i,c] <= vmax**2  for b in Bus for i in busbar for c in cont_list) , name='eqvmaxb')
@@ -953,7 +1058,7 @@ def create_OSP_substation_v62(
             }
     
     
-def solve_OSP_substation_v62(
+def solve_benders_substation_osp(
     data,
     TopologyMP,
     model0,
@@ -967,12 +1072,13 @@ def solve_OSP_substation_v62(
         TopologyMP: Master-problem topology and dispatch values to impose on
             the subproblem.
         model0: Unsolved OSP model created by
-            ``create_OSP_substation_v62``.
+            ``create_benders_substation_osp``.
         cont_list: Contingency identifiers represented by ``model0``.
 
     Returns:
         A dictionary containing linking-constraint duals, solve time, the OSP
-        objective, contingency shedding costs, and demand-level shedding.
+        objective, contingency shedding costs, demand-level shedding, and
+        updated linearization points.
     """
     
     
@@ -1065,6 +1171,12 @@ def solve_OSP_substation_v62(
                 PdShed_dic.loc[d,i,c]=model.getVarByName('Pdi_Shed['+str(d)+','+str(i)+','+str(c)+']').x
     
     
+    Vol0_li, delta0_li = _extract_linearization_points(
+        model,
+        Lines,
+        cont_list,
+    )
+
     # Results
     return { 
         'Mu':Mu,
@@ -1072,11 +1184,13 @@ def solve_OSP_substation_v62(
         'OF_OSP': model.getVarByName('OF_OSP').x, 
         'ShedCost_df':ShedCost_df,
         'PdShed_dic':PdShed_dic,
+        'Vol0_li':Vol0_li,
+        'delta0_li':delta0_li,
     }
     
     
 
-def BCC_Benders_Classic_AC_v62(
+def SC_SR_Benders(
     data,
     line_cont_list=[],
     Max_FSP_iter=10,
@@ -1094,6 +1208,8 @@ def BCC_Benders_Classic_AC_v62(
     Zfixdict=None,
     PQgFix=None,
     PgFix=None,
+    Vol0_li=None,
+    delta0_li=None,
     print_result=False,
 ):
     """Solve the BD-C or BD-H security-constrained reconfiguration model.
@@ -1124,6 +1240,10 @@ def BCC_Benders_Classic_AC_v62(
         PQgFix: Optional dictionary of busbar-level active and reactive
             generation values to fix.
         PgFix: Optional dictionary of total active-generation values to fix.
+        Vol0_li: Optional branch-voltage linearization points indexed by line
+            endpoints and contingency; unit values are used when omitted.
+        delta0_li: Optional branch-angle linearization points indexed by line
+            endpoints and contingency; zero values are used when omitted.
         print_result: Print iteration and solution details when ``True``.
 
     Returns:
@@ -1188,15 +1308,22 @@ def BCC_Benders_Classic_AC_v62(
     Pflow_li=model.addVars(Lines,busbar,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Pflow_li')
     Qflow=model.addVars(Lines,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qflow')         
     Qflow_li=model.addVars(Lines,busbar,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qflow_li')
+    Ploss=model.addVars(Lines,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Ploss')
+    Qloss=model.addVars(Lines,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qloss')
+    Ploss_vol=model.addVars(Lines,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Ploss_vol')
+    Qloss_vol=model.addVars(Lines,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qloss_vol')
+    Ploss_delta=model.addVars(Lines,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Ploss_delta')
+    Qloss_delta=model.addVars(Lines,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qloss_delta')
+    epsilon=model.addVars(Lines,lb=0,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='epsilon')
     
     
     Pflow_bus=model.addVars(Bus,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Pflow_bus')  #From b1 to b2!
     Qflow_bus=model.addVars(Bus,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qflow_bus')  #From b1 to b2!
 
     delta_bi=model.addVars(Bus,busbar,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='delta_bi') 
-    delta_li=model.addVars(Lines,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='delta_le') 
+    delta_li=model.addVars(Lines,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='delta_li')
     V2_bi=model.addVars(Bus,busbar,lb=0,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='delta_bi') 
-    V2_li=model.addVars(Lines,lb=0,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='delta_le') 
+    V2_li=model.addVars(Lines,lb=0,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='V2_li')
     
    
     z_bus=model.addVars(Bus,vtype=GRB.BINARY,name='z_bus')    
@@ -1216,6 +1343,11 @@ def BCC_Benders_Classic_AC_v62(
         all_sub_cont_list+=[b,str(b+'-1'),str(b+'-2')]
             
     all_cont=all_sub_cont_list+line_cont_list #used for reporting LoadShedding_df
+    linearization_cont=[0]+all_cont
+    if Vol0_li is None:
+        Vol0_li={(l,i,j,c):1.0 for l,i,j in Lines for c in linearization_cont}
+    if delta0_li is None:
+        delta0_li={(l,i,j,c):0.0 for l,i,j in Lines for c in linearization_cont}
     
 
     if substation_OSP==True and all_cont_OSP==False:
@@ -1367,15 +1499,37 @@ def BCC_Benders_Classic_AC_v62(
 
     model.addConstrs( (  Pflow[l,i,j] == 
     0.5*branch.loc[(l,i,j)]['g_ij']*( V2_li[l,i,j] - V2_li[l,j,i] )
-    -branch.loc[(l,i,j)]['b_ij']*(delta_li[l,i,j]-delta_li[l,j,i]) #+ Ploss[l,i,j]
+    -branch.loc[(l,i,j)]['b_ij']*(delta_li[l,i,j]-delta_li[l,j,i]) + Ploss[l,i,j]
                             for l,i,j in Lines ) , name='eqPij')
     
     model.addConstrs( (  Qflow[l,i,j] == 
     -0.5*branch.loc[(l,i,j)]['b_ij']*(V2_li[l,i,j] - V2_li[l,j,i])
-    -branch.loc[(l,i,j)]['g_ij']*(delta_li[l,i,j]-delta_li[l,j,i]) 
+    -branch.loc[(l,i,j)]['g_ij']*(delta_li[l,i,j]-delta_li[l,j,i]) + Qloss[l,i,j]
                             for l,i,j in Lines) , name='eqQij')
     
-    # Branch losses
+    # Linearized branch-loss equations for the normal operating state.
+    model.addConstrs((Ploss[l,i,j] == Ploss_vol[l,i,j] + Ploss_delta[l,i,j]
+                      for l,i,j in Lines), name='eqPloss_total')
+    model.addConstrs((Qloss[l,i,j] == Qloss_vol[l,i,j] + Qloss_delta[l,i,j]
+                      for l,i,j in Lines), name='eqQloss_total')
+    model.addConstrs((0 <= Ploss[l,i,j] + epsilon[l,i,j]
+                      for l,i,j in Lines), name='eqPloss_pos')
+    model.addConstrs((Ploss_vol[l,i,j] ==
+                      branch.loc[(l,i,j)]['g_ij']*((Vol0_li[l,i,j,0]-Vol0_li[l,j,i,0])/(Vol0_li[l,i,j,0]+Vol0_li[l,j,i,0]))*(V2_li[l,i,j]-V2_li[l,j,i])
+                      -0.5*branch.loc[(l,i,j)]['g_ij']*(Vol0_li[l,i,j,0]-Vol0_li[l,j,i,0])**2
+                      for l,i,j in Lines), name='eqPloss_vol')
+    model.addConstrs((Qloss_vol[l,i,j] ==
+                      -branch.loc[(l,i,j)]['b_ij']*((Vol0_li[l,i,j,0]-Vol0_li[l,j,i,0])/(Vol0_li[l,i,j,0]+Vol0_li[l,j,i,0]))*(V2_li[l,i,j]-V2_li[l,j,i])
+                      +0.5*branch.loc[(l,i,j)]['b_ij']*(Vol0_li[l,i,j,0]-Vol0_li[l,j,i,0])**2
+                      for l,i,j in Lines), name='eqQloss_vol')
+    model.addConstrs((Ploss_delta[l,i,j] ==
+                      branch.loc[(l,i,j)]['g_ij']*(delta0_li[l,i,j,0]-delta0_li[l,j,i,0])*(delta_li[l,i,j]-delta_li[l,j,i])
+                      -0.5*branch.loc[(l,i,j)]['g_ij']*(delta0_li[l,i,j,0]-delta0_li[l,j,i,0])**2
+                      for l,i,j in Lines), name='eqPloss_delta')
+    model.addConstrs((Qloss_delta[l,i,j] ==
+                      -branch.loc[(l,i,j)]['b_ij']*(delta0_li[l,i,j,0]-delta0_li[l,j,i,0])*(delta_li[l,i,j]-delta_li[l,j,i])
+                      +0.5*branch.loc[(l,i,j)]['b_ij']*(delta0_li[l,i,j,0]-delta0_li[l,j,i,0])**2
+                      for l,i,j in Lines), name='eqQloss_delta')
 
 
     # Voltage magnitude
@@ -1544,7 +1698,12 @@ def BCC_Benders_Classic_AC_v62(
     NumConstrs['Mp'] = NumConstrsMP
 
     for c in line_cont_list:
-        res = create_FSP_line_v62(data,cont_list=[c])
+        res = create_benders_line_fsp(
+            data,
+            cont_list=[c],
+            Vol0_li=Vol0_li,
+            delta0_li=delta0_li,
+        )
         FSP_models[c] = res['model']
         NumBinVars['SP'][c] = res['NumBinVars'] 
         NumConVars['SP'][c] = res['NumConVars'] 
@@ -1552,8 +1711,9 @@ def BCC_Benders_Classic_AC_v62(
 
     if substation_OSP==True and all_cont_OSP==False:
         for b in Bus:
-            res = create_OSP_substation_v62(data,cont_list=[b,str(b+'-1'),str(b+'-2')]
-                                                    ,Up_redispatch=Up_redispatch,Dn_redispatch=Dn_redispatch,Max_Sw_bus=Max_Sw_bus)
+            res = create_benders_substation_osp(data,cont_list=[b,str(b+'-1'),str(b+'-2')]
+                                                    ,Up_redispatch=Up_redispatch,Dn_redispatch=Dn_redispatch,Max_Sw_bus=Max_Sw_bus,
+                                                    Vol0_li=Vol0_li,delta0_li=delta0_li)
             OSP_models[b] = res['model']
             NumBinVars['SP'][b] = res['NumBinVars'] 
             NumConVars['SP'][b] = res['NumConVars'] 
@@ -1562,8 +1722,9 @@ def BCC_Benders_Classic_AC_v62(
             
     elif substation_OSP==False and all_cont_OSP==True:
         for c in all_cont:
-            res =create_OSP_substation_v62(data,cont_list=[c]
-                                                    ,Up_redispatch=Up_redispatch,Dn_redispatch=Dn_redispatch,Max_Sw_bus=Max_Sw_bus)
+            res =create_benders_substation_osp(data,cont_list=[c]
+                                                    ,Up_redispatch=Up_redispatch,Dn_redispatch=Dn_redispatch,Max_Sw_bus=Max_Sw_bus,
+                                                    Vol0_li=Vol0_li,delta0_li=delta0_li)
             
             OSP_models[c] = res['model']
             NumBinVars['SP'][c] = res['NumBinVars'] 
@@ -1594,7 +1755,9 @@ def BCC_Benders_Classic_AC_v62(
                 
 
                 for c in (line_cont_list):
-                    result = solve_FSP_line_v62(data=data,TopologyMP=TopologyMP,model0=FSP_models[c],print_result=False)
+                    result = solve_benders_line_fsp(data=data,TopologyMP=TopologyMP,model0=FSP_models[c],cont_list=[c],print_result=False)
+                    Vol0_li.update(result['Vol0_li'])
+                    delta0_li.update(result['delta0_li'])
                     FSP_Objc=result['OF_FSP']
                     FSP_Obj+=FSP_Objc
                     Mu=result['Mu']
@@ -1660,7 +1823,9 @@ def BCC_Benders_Classic_AC_v62(
                 sub_cont_list+=[b,str(b+'-1'),str(b+'-2')]
                 
                 
-                result = solve_OSP_substation_v62(data=data,model0=OSP_models[b],TopologyMP=TopologyMP, cont_list=sub_cont_list)
+                result = solve_benders_substation_osp(data=data,model0=OSP_models[b],TopologyMP=TopologyMP, cont_list=sub_cont_list)
+                Vol0_li.update(result['Vol0_li'])
+                delta0_li.update(result['delta0_li'])
                 OF_OSP_b[b]=result['OF_OSP']
                 OF_OSP+=OF_OSP_b[b]
                 Mu[b]=result['Mu']
@@ -1779,7 +1944,9 @@ def BCC_Benders_Classic_AC_v62(
             for c in (all_cont): #OSP========== 
                 
                     
-                result = solve_OSP_substation_v62(data=data,cont_list=[c],TopologyMP=TopologyMP,model0=OSP_models[c])
+                result = solve_benders_substation_osp(data=data,cont_list=[c],TopologyMP=TopologyMP,model0=OSP_models[c])
+                Vol0_li.update(result['Vol0_li'])
+                delta0_li.update(result['delta0_li'])
                 OF_OSP_c[c]=result['OF_OSP']
                 OF_OSP+=OF_OSP_c[c]
                 Mu[c]=result['Mu']
@@ -1860,6 +2027,11 @@ def BCC_Benders_Classic_AC_v62(
     for g in G:
         Pg_dict[g] = Pgi[g,'busbar1'].x*(1-z_g[g].x) + Pgi[g,'busbar2'].x*(z_g[g].x)
         Qg_dict[g] = Qgi[g,'busbar1'].x*(1-z_g[g].x) + Qgi[g,'busbar2'].x*(z_g[g].x)
+
+    # Update the normal-state linearization points from the final master solve.
+    for l,i,j in Lines:
+        Vol0_li[l,i,j,0] = np.sqrt(V2_li[l,i,j].x)
+        delta0_li[l,i,j,0] = delta_li[l,i,j].x
     
     
     # Results
@@ -1881,7 +2053,9 @@ def BCC_Benders_Classic_AC_v62(
         'time_iter_detail':time_iter_detail,
         'NumBinVars':NumBinVars,
         'NumConVars':NumConVars,
-        'NumConstrs':NumConstrs
+        'NumConstrs':NumConstrs,
+        'Vol0_li':Vol0_li,
+        'delta0_li':delta0_li
     }
 
     

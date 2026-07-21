@@ -1,60 +1,80 @@
 """Iterative topology-fixing heuristic baseline from Section IV-A.
 
-The method repeatedly solves the MIP while fixing and refining candidate
-substation configurations under the selected contingency set.
+1-Opt-H: an iterative one-step improvement heuristic
+that starts from the initial topology T_0 and,
+at each iteration, flips a single binary variable that reduces the objective,
+until no improving move exists.
 """
 
-# %% [markdown]
-# # Busbar Coupler Contingency (BCC) Project
-#  
-# # BCC_full_model + ACOPF equations (linear)
-# 
-# 
-# 
-# 
-
-# %%
-# Libraries
-#%reset 
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-from itertools import combinations
 import itertools
 import gurobipy as gp
 from gurobipy import GRB
 from gurobipy import quicksum
-import networkx as nx
 import time
-from copy import deepcopy
-import random
 from tqdm import tqdm
-import sys
 
 from .original_MIP_model import *  # Shared data preparation and AC-OPF utilities.
 
-# # Iterative_Heuristic
-# %%
 
-def Create_v65_AC_MIP(data,cont_list=None,
-                                        Max_Sw_bus=0,
-                                    Up_redispatch=0,Dn_redispatch=1.0,
-                                           Zfixdict=None,#fixed topology
-                                    Zinitial=None,
-                                   PQgFix=None, PgFix=None,
-                                   FixedCost=False,Alpha=0,Pg_market=None,
-                                   Probabilistic=False,
-                                    SolverTime=600,Threads=None,
-                                    line_shedding=True,
-                                     Vol0_li=None
-                                          ):
+def create_iterative_heuristic_model(
+    data,
+    cont_list=None,
+    Max_Sw_bus=0,
+    Up_redispatch=0,
+    Dn_redispatch=1.0,
+    Zfixdict=None,
+    Zinitial=None,
+    PQgFix=None,
+    PgFix=None,
+    FixedCost=False,
+    Alpha=0,
+    Pg_market=None,
+    Probabilistic=False,
+    SolverTime=600,
+    Threads=None,
+    line_shedding=True,
+    Vol0_li=None,
+    delta0_li=None,
+):
+    """Build the reusable MIP for the iterative topology heuristic.
+
+    Args:
+        data: Network and model-parameter dictionary returned by
+            ``read_data_AC``.
+        cont_list: Contingency identifiers represented in the model.
+        Max_Sw_bus: Maximum number of busbar-splitting actions allowed.
+        Up_redispatch: Fraction of generator capacity available for upward
+            active-power redispatch.
+        Dn_redispatch: Fraction of generator capacity available for downward
+            active-power redispatch.
+        Zfixdict: Optional dictionary of topology variables to fix.
+        Zinitial: Optional initial topology used as a Gurobi warm start.
+        PQgFix: Optional busbar-level active and reactive generation to fix.
+        PgFix: Optional total active-generation values to fix.
+        FixedCost: Enforce the market-generation cost limit when ``True``.
+        Alpha: Relative margin applied to the market-generation cost limit.
+        Pg_market: Reference market dispatch used by the fixed-cost constraint.
+        Probabilistic: Weight contingency shedding costs by their probabilities
+            when ``True``.
+        SolverTime: Gurobi time limit in seconds.
+        Threads: Optional number of Gurobi solver threads.
+        line_shedding: Line-shedding configuration flag retained from the case
+            study interface.
+        Vol0_li: Optional branch-voltage linearization points; unit values are
+            used when omitted.
+        delta0_li: Optional branch-angle linearization points; zero values are
+            used when omitted.
+
+    Returns:
+        The configured, unsolved Gurobi model.
+    """
     
     
-    #======  data
-    
+    # Input data
     Sbase=data['Sbase']
     Max_MIPGap=data['Max_MIPGap']
-#     Max_timelimit=data['Max_timelimit']=600 #900
     Bus=data['Bus']    # for b in Bus
     busbar=data['busbar']
     branch=data['branch']
@@ -79,17 +99,13 @@ def Create_v65_AC_MIP(data,cont_list=None,
     BigM_busbar=data['BigM_busbar']
 
     
-    
-    #======
-    
+    # Model configuration
     model=gp.Model('SBF_Preventive SC line contingency')
     model.Params.OutputFlag=1
     
     cont_list=cont_list.copy()
-     #full_cont_list has all the states including the 0 state of normal
+    # The contingency list includes the normal operating state (0).
     
-#     print("======== contingency list ======")
-#     print('        ',cont_list,'\n\n')
     
     model.Params.MIPGap=Max_MIPGap
     model.Params.timelimit=SolverTime
@@ -97,22 +113,24 @@ def Create_v65_AC_MIP(data,cont_list=None,
         model.Params.Threads = Threads
 
     
-
-   
     Max_Sw_bus=Max_Sw_bus  
   
 
-    
     if Vol0_li is None:
         print('Vol0 is None')
         Vol0_li={}
         for l,i,j in Lines:
             for c in cont_list:
-                Vol0_li[l,i,j,c]=1
+                Vol0_li[l,i,j,c]=1.0
+
+    if delta0_li is None:
+        delta0_li={}
+        for l,i,j in Lines:
+            for c in cont_list:
+                delta0_li[l,i,j,c]=0.0
     
     
-  
-    
+    # Variables
     Pgi=model.addVars(G,busbar,lb=0,vtype=GRB.CONTINUOUS,name='Pgi')  
     dPgi_up=model.addVars(G,busbar,cont_list,lb=0,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='dPgi_up')
     dPgi_dn=model.addVars(G,busbar,cont_list,lb=0,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='dPgi_dn')
@@ -129,14 +147,18 @@ def Create_v65_AC_MIP(data,cont_list=None,
 
     Pflow=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Pflow')         
     Pflow_li=model.addVars(Lines,busbar,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Pflow_li')
-    Qflow=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qflow')         
+    Qflow=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qflow')
     Qflow_li=model.addVars(Lines,busbar,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qflow_li')
-    
-#     Ploss=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Ploss') 
-#     epsilon=model.addVars(Lines,cont_list,lb=0,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='epsilon') 
-#     Qloss=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qloss')
 
+    Ploss=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Ploss')
+    Qloss=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qloss')
+    Ploss_vol=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Ploss_vol')
+    Qloss_vol=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qloss_vol')
+    Ploss_delta=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Ploss_delta')
+    Qloss_delta=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qloss_delta')
+    epsilon=model.addVars(Lines,cont_list,lb=0,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='epsilon')
     
+
     Pflow_bus=model.addVars(Bus,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Pflow_bus')  #From b1 to b2!
     Qflow_bus=model.addVars(Bus,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qflow_bus')  #From b1 to b2!
 
@@ -160,9 +182,6 @@ def Create_v65_AC_MIP(data,cont_list=None,
     TotalShedCost=model.addVar(lb=0,vtype=GRB.CONTINUOUS,name='TotalShedCost')
 
 
-#### ========== initial value
-
-
     if Zfixdict==None:
         for b in Bus:
             z_bus[b].Start=1 
@@ -174,8 +193,7 @@ def Create_v65_AC_MIP(data,cont_list=None,
             z_d[d].Start=0
         
         
-        
-    # Fix topology 
+    # Fixed topology
     if Zfixdict!=None:
         model.addConstrs((  z_bus[b] == Zfixdict['bus'][b]   for b in Bus), name='Fix_bus')
         model.addConstrs((  z_g[g] == Zfixdict['g'][g]   for g in G), name='Fix_g')
@@ -183,9 +201,7 @@ def Create_v65_AC_MIP(data,cont_list=None,
         model.addConstrs((  z_li[l,i,j] == Zfixdict['l_i'][l,i,j]   for l,i,j in Lines), name='Fix_li')
             
             
-        
-        
-    #Fix the dispatch
+    # Fixed dispatch
     if PQgFix!=None:
         model.addConstrs((  Pgi[g,i] == PQgFix['Pg'][g,i]   for g in G for i in busbar), name='Fix_Pg')
         model.addConstrs((  Qgi[g,i] == PQgFix['Qg'][g,i]   for g in G for i in busbar), name='Fix_Qg')
@@ -195,7 +211,6 @@ def Create_v65_AC_MIP(data,cont_list=None,
                              for g in G ), name='eq_Pg1')
         model.addConstrs( (  Pgi[g,'busbar2'] == z_g[g]*PgFix[g] 
                              for g in G  ), name='eq_Pg2')
-        
         
         
     if Zinitial!=None:    
@@ -209,11 +224,7 @@ def Create_v65_AC_MIP(data,cont_list=None,
             z_d[d].Start=Zinitial['d'][d] 
         
         
-         
-
-# Binary Equations ==================================================
-
-    # Reliability switching 
+    # Topology and switching constraints
     eq_2line_busbar2=model.addConstrs(( 2*(1-z_bus[b]) <= 
                                    quicksum(z_li[l,i,j] for l,i,j in Lines.select('*',b,'*')) 
                             for b in Bus ), name='eq_2line_busbar2' ) 
@@ -224,23 +235,20 @@ def Create_v65_AC_MIP(data,cont_list=None,
                             for b in Bus
                              if NumberL2B[b]<=3  ), name='eq_2line_busbar3' )
     
-    # max Switching ================
+    # Maximum number of busbar splits
     eq_MaxSw_bus=model.addConstr((  quicksum( (1-z_bus[b]) for b in Bus) <= Max_Sw_bus) , name='eq_MaxSw_bus') 
     
 
-#     symmetry 
     if Zfixdict==None:
         for b in Bus:
             lmin,b=L2B.select('*',b)[0]
             lmin,i,j=Lines.select(lmin,b,'*')[0]
             eq_symmetry1=model.addConstr((  z_li[lmin,i,j] ==0  ), name='eq_symmetry')
-#         print(lmin,i,j)
 
     eq_zbus_ref=model.addConstr( (  z_bus[Bus[0]]==1    ), name='eq_zbus_ref')
 
         
-    
-    #== Gen
+    # Active generation
     
     eq_Pg1min=model.addConstrs( (   (1-z_g[g])*Gen_data.loc[g]['Pmin'] <= Pgi[g,'busbar1']+dPgi_up[g,'busbar1',c]-dPgi_dn[g,'busbar1',c]   
                              for g in G for c in cont_list  ), name='eq_Pg1min')
@@ -255,7 +263,7 @@ def Create_v65_AC_MIP(data,cont_list=None,
     model.addConstrs( (   Pg[g] == Pgi[g,'busbar1']+Pgi[g,'busbar2']   for g in G   ), name='eq_Pg')
     model.addConstrs( (   Qg[g] == Qgi[g,'busbar1']+Qgi[g,'busbar2']   for g in G   ), name='eq_Qg')
     
-    #Qg
+    # Reactive generation
     eq_Qg1min=model.addConstrs( (   (1-z_g[g])*Gen_data.loc[g]['Qmin'] <= Qgi[g,'busbar1']+dQgi_up[g,'busbar1',c]-dQgi_dn[g,'busbar1',c]   
                              for g in G for c in cont_list  ), name='eq_Qg1min')
     eq_Qg1max=model.addConstrs( (    Qgi[g,'busbar1']+dQgi_up[g,'busbar1',c]-dQgi_dn[g,'busbar1',c] <=(1-z_g[g])*Gen_data.loc[g]['Qmax']  
@@ -267,10 +275,7 @@ def Create_v65_AC_MIP(data,cont_list=None,
                              for g in G for c in cont_list  ), name='eq_Pg2max')
     
 
-    
-    
-    
-    # =======   Corrective redispatch/ reserve equations =====================================
+    # Corrective redispatch
     
     Eq_dPgUp_res=model.addConstrs(( dPgi_up[g,i,c] <= Gen_data.loc[g]['Pmax']*Up_redispatch  
                           for g in G for i in busbar for c in cont_list ),name='Eq_dPgUp_res')
@@ -291,8 +296,7 @@ def Create_v65_AC_MIP(data,cont_list=None,
                             for g in G for i in busbar for c in cont_list if c==0 ),name='Eq_dQgDn_res')
 
     
-
-    #Pd
+    # Demand
     eq_Pd1=model.addConstrs( ( Pdi[d,'busbar1'] == (1-z_d[d])*Pdemand.loc[d]['Pd']   
                             for d in DemandSet ), name='eq_Pd1')
     eq_Pd2=model.addConstrs( ( Pdi[d,'busbar2'] == z_d[d]*Pdemand.loc[d]['Pd']   
@@ -302,7 +306,7 @@ def Create_v65_AC_MIP(data,cont_list=None,
     eq_Qd2=model.addConstrs( ( Qdi[d,'busbar2'] == z_d[d]*Pdemand.loc[d]['Qd']   
                             for d in DemandSet ), name='eq_Qd2')
     
-    # Load sheddding
+    # Load shedding
     model.addConstrs( (  Pdi_Shed[d,'busbar1',c]==Pdi[d,'busbar1'] 
                               for b in Bus for d,b in D2B.select('*',b) 
                                for c in cont_list if c==str(b+'-1') ) , name='eq_Pd1Shed')
@@ -312,25 +316,13 @@ def Create_v65_AC_MIP(data,cont_list=None,
     model.addConstrs( (  Pdi_Shed[d,i,c]<=Pdi[d,i] 
                               for d in DemandSet for i in busbar 
                                for c in cont_list) , name='eq_PdShedlimit')
-    # model.addConstrs( (  Pdi_Shed[d,i,c]==0 
-    #                           for d in DemandSet for i in busbar 
-    #                            for c in cont_list
-    #                   if c==0) , name='eq_PdShedlimit0')
     
     model.addConstrs( (  Qdi_Shed[d,i,c]== (Pdemand.loc[d]['Qd'])/(Pdemand.loc[d]['Pd'])*Pdi_Shed[d,i,c]
                               for d in DemandSet for i in busbar 
                                for c in cont_list) , name='eq_QdShed')
     
-    # if line_shedding==False:
-    #     model.addConstrs( (  Pdi_Shed[d,i,c]==0 
-    #                               for d in DemandSet for i in busbar 
-    #                                for c in cont_list
-    #                           if c in data['radial_lines'] ) , name='eq_PdShed_line0')
 
-
-###=== PF equations ===================================================
-
-##===== line Contingency 
+    # Line-contingency constraints
     eqPflow1_cont=model.addConstrs( ( Pflow[l,i,j,c]==0   
                             for l,i,j in Lines 
                            for c in cont_list               
@@ -350,7 +342,7 @@ def Create_v65_AC_MIP(data,cont_list=None,
                            for c in cont_list                     
                            if c==l ) , name='Eq_Qflow_ei_cont')
 
-    ##========== flow limits   
+    # Branch-flow limits
     eq_flow1min=model.addConstrs( ( -(1-z_li[l,i,j])*branch.loc[(l,i,j)]['limit'] <= Pflow_li[l,i,j,'busbar1',c] 
                              for l,i,j in Lines  for c in cont_list ) ,name='eq_flow1min')
     eq_flow1max=model.addConstrs( ( Pflow_li[l,i,j,'busbar1',c] <= (1-z_li[l,i,j])*branch.loc[(l,i,j)]['limit']  
@@ -376,7 +368,7 @@ def Create_v65_AC_MIP(data,cont_list=None,
     eq_flow=model.addConstrs((   Qflow[l,i,j,c] == Qflow_li[l,i,j,'busbar1',c]+Qflow_li[l,i,j,'busbar2',c]  
                                 for l,i,j in Lines for c in cont_list), name='eq_Qflow')
     
-    # tight AC limits
+    # Tight linear AC limits
     model.addConstrs( (  Pflow[l,i,j,c] + np.tan(np.pi/6)*Qflow[l,i,j,c] <= (1-beta)*branch.loc[(l,i,j)]['limit']
                             for l,i,j in Lines for c in cont_list   ) , name='eqPij1')
     
@@ -390,35 +382,49 @@ def Create_v65_AC_MIP(data,cont_list=None,
                             for l,i,j in Lines for c in cont_list   ) , name='eqPij4')
 
     
-    
-    # AC Pij-V equations! 
+    # Linear AC branch-flow equations
 
-    model.addConstrs( (  Pflow[l,i,j,c] == 
+    model.addConstrs( (  Pflow[l,i,j,c] ==
     0.5*branch.loc[(l,i,j)]['g_ij']*( V2_li[l,i,j,c] - V2_li[l,j,i,c] )
-    -branch.loc[(l,i,j)]['b_ij']*(delta_li[l,i,j,c]-delta_li[l,j,i,c]) #+ Ploss[l,i,j,c]
+    -branch.loc[(l,i,j)]['b_ij']*(delta_li[l,i,j,c]-delta_li[l,j,i,c]) + Ploss[l,i,j,c]
                             for l,i,j in Lines
                            for c in cont_list if l!=c   ) , name='eqPij')
     
-    model.addConstrs( (  Qflow[l,i,j,c] == 
+    model.addConstrs( (  Qflow[l,i,j,c] ==
     -0.5*branch.loc[(l,i,j)]['b_ij']*(V2_li[l,i,j,c] - V2_li[l,j,i,c])
-    -branch.loc[(l,i,j)]['g_ij']*(delta_li[l,i,j,c]-delta_li[l,j,i,c]) 
-#     -V2_li[l,i,j,c]*(branch.loc[(l,i,j)]['b']/2) #+ Qloss[l,i,j,c]
+    -branch.loc[(l,i,j)]['g_ij']*(delta_li[l,i,j,c]-delta_li[l,j,i,c]) + Qloss[l,i,j,c]
                             for l,i,j in Lines
                            for c in cont_list if l!=c    ) , name='eqQij')
     
-    #Loss
-#     model.addConstrs( (  Ploss[l,i,j,c] == 
-#                 branch.loc[(l,i,j)]['g_ij']*((Vol0_li[l,i,j,c]-Vol0_li[l,j,i,c])/(Vol0_li[l,i,j,c]+Vol0_li[l,j,i,c]))*(V2_li[l,i,j,c]-V2_li[l,j,i,c])\
-#                 -0.5*branch.loc[(l,i,j)]['g_ij']*(Vol0_li[l,i,j,c]-Vol0_li[l,j,i,c])**2  
-#                        +epsilon[l,i,j,c]
-#                             for l,i,j in Lines for c in cont_list if l!=c  ) , name='eqPloss')
-#     model.addConstrs( (  Qloss[l,i,j,c] == 
-#                 -branch.loc[(l,i,j)]['b_ij']*((Vol0_li[l,i,j,c]-Vol0_li[l,j,i,c])/(Vol0_li[l,i,j,c]+Vol0_li[l,j,i,c]))*(V2_li[l,i,j,c]-V2_li[l,j,i,c])\
-#                 +0.5*branch.loc[(l,i,j)]['b_ij']*(Vol0_li[l,i,j,c]-Vol0_li[l,j,i,c])**2  
-#                             for l,i,j in Lines for c in cont_list if l!=c  ) , name='eqQloss')
+    # Linearized branch-loss equations
+    model.addConstrs( (  Ploss[l,i,j,c] == Ploss_vol[l,i,j,c] + Ploss_delta[l,i,j,c]
+                            for l,i,j in Lines for c in cont_list if l!=c  ) , name='eqPloss_total')
+    model.addConstrs( (  Qloss[l,i,j,c] == Qloss_vol[l,i,j,c] + Qloss_delta[l,i,j,c]
+                            for l,i,j in Lines for c in cont_list if l!=c  ) , name='eqQloss_total')
+
+    model.addConstrs( (  0 <= Ploss[l,i,j,c] + epsilon[l,i,j,c]
+                            for l,i,j in Lines for c in cont_list if l!=c  ) , name='eqPloss_pos')
+
+    model.addConstrs( (  Ploss_vol[l,i,j,c] ==
+                branch.loc[(l,i,j)]['g_ij']*((Vol0_li[l,i,j,c]-Vol0_li[l,j,i,c])/(Vol0_li[l,i,j,c]+Vol0_li[l,j,i,c]))*(V2_li[l,i,j,c]-V2_li[l,j,i,c])
+                -0.5*branch.loc[(l,i,j)]['g_ij']*(Vol0_li[l,i,j,c]-Vol0_li[l,j,i,c])**2
+                            for l,i,j in Lines for c in cont_list if l!=c  ) , name='eqPloss_vol')
+    model.addConstrs( (  Qloss_vol[l,i,j,c] ==
+                -branch.loc[(l,i,j)]['b_ij']*((Vol0_li[l,i,j,c]-Vol0_li[l,j,i,c])/(Vol0_li[l,i,j,c]+Vol0_li[l,j,i,c]))*(V2_li[l,i,j,c]-V2_li[l,j,i,c])
+                +0.5*branch.loc[(l,i,j)]['b_ij']*(Vol0_li[l,i,j,c]-Vol0_li[l,j,i,c])**2
+                            for l,i,j in Lines for c in cont_list if l!=c  ) , name='eqQloss_vol')
+
+    model.addConstrs( (  Ploss_delta[l,i,j,c] ==
+                branch.loc[(l,i,j)]['g_ij']*(delta0_li[l,i,j,c]-delta0_li[l,j,i,c])*(delta_li[l,i,j,c]-delta_li[l,j,i,c])
+                -0.5*branch.loc[(l,i,j)]['g_ij']*(delta0_li[l,i,j,c]-delta0_li[l,j,i,c])**2
+                            for l,i,j in Lines for c in cont_list if l!=c  ) , name='eqPloss_delta')
+    model.addConstrs( (  Qloss_delta[l,i,j,c] ==
+                -branch.loc[(l,i,j)]['b_ij']*(delta0_li[l,i,j,c]-delta0_li[l,j,i,c])*(delta_li[l,i,j,c]-delta_li[l,j,i,c])
+                +0.5*branch.loc[(l,i,j)]['b_ij']*(delta0_li[l,i,j,c]-delta0_li[l,j,i,c])**2
+                            for l,i,j in Lines for c in cont_list if l!=c  ) , name='eqQloss_delta')
 
 
-    # voltage
+    # Voltage magnitude
     model.addConstrs( ( V2_bi[b,i,c] <= vmax**2  for b in Bus for i in busbar for c in cont_list) , name='eqvmaxb')
     model.addConstrs( ( V2_bi[b,i,c] >= vmin**2  for b in Bus for i in busbar for c in cont_list) , name='eqvminb')
     model.addConstrs( ( V2_li[l,i,j,c] <= vmax**2 for l,i,j in Lines for c in cont_list) , name='eqvmaxl')
@@ -448,7 +454,7 @@ def Create_v65_AC_MIP(data,cont_list=None,
                                    for c in cont_list
                                     if c!=l), name='eq_delta_lb2Frmax')
     
-    #V2
+    # Squared voltage magnitude
     eq_V2_bus1=model.addConstrs((   -MaxV2*(1-z_bus[b]) <= V2_bi[b,'busbar1',ll]-V2_bi[b,'busbar2',ll] 
                                for b in Bus for ll in cont_list 
                                     if b!=ll if str(b+'-1')!=ll  if str(b+'-2')!=ll), name='eq_V2_bus1')
@@ -476,7 +482,7 @@ def Create_v65_AC_MIP(data,cont_list=None,
     eq_delta_ref=model.addConstrs((delta_bi[Bus[0],'busbar1',ll]==0     for ll in cont_list ), name='ref_bus_angle' ) 
 
 
-    #busbar & coupler contingency
+    # Busbar and coupler contingencies
     model.addConstrs((  Pflow_bus[b,ll]<=BigM_busbar*(z_bus[b])     
                           for b in Bus for ll in cont_list if b!=ll), name='eq_busbarPflowmax')
     model.addConstrs((  -Pflow_bus[b,ll]<=BigM_busbar*(z_bus[b])     
@@ -520,8 +526,7 @@ def Create_v65_AC_MIP(data,cont_list=None,
                            if c==str(b+'-2') ) , name='Eq_Qflow_ei_bus2contFr')
     
 
-## ==== Balance ================ 
-    
+    # Active- and reactive-power balance
     eq_balance_busbar1=model.addConstrs((                                        
                 quicksum( Pgi[g,m] +dPgi_up[g,m,ll]-dPgi_dn[g,m,ll]  for g,b in G2B.select('*',b)  )
                 -quicksum( Pdi[d,m] - Pdi_Shed[d,m,ll]  for d,b in D2B.select('*',b)   ) ==
@@ -554,8 +559,7 @@ def Create_v65_AC_MIP(data,cont_list=None,
                             if m=='busbar2'  if ll!=str(b+'-2') ), name='eq_balance2')
 
 
-
-    # cost!
+    # Objective components
     
     model.addConstr(GenCost == quicksum(Gen_data.loc[g]['b']*Pg[g] for g in G) ,name='Eq_GC')
     
@@ -587,35 +591,46 @@ def Create_v65_AC_MIP(data,cont_list=None,
         model.addConstr(OF == GenCost + RDCost + TotalShedCost  ,name='Eq_OF')
 
 
-
     model.setObjective(OF,GRB.MINIMIZE)
 
     model.update()
-#     model.write('BCC_v60_AC_full.lp')
 
 
-    
-    
+    # Configured model
     return model
     
     
+def solve_iterative_heuristic_iteration(
+    data,
+    TopologyFix,
+    model0,
+    cont_list,
+    K_Opt=1,
+    print_result=False,
+):
+    """Solve one topology-refinement iteration.
 
-# %%
-def Solve_MIP_v65(data,TopologyFix,model0,cont_list,K_Opt=1,print_result=False):
-    
-    """Solve for K_opt
+    Previously accepted topology decisions are fixed, while at most ``K_Opt``
+    additional decisions may change during this solve.
 
-    fix the ones that need to be fixed and count them. 
-    the rest can be changed with max k
-    
-    
+    Args:
+        data: Network and model-parameter dictionary returned by
+            ``read_data_AC``.
+        TopologyFix: Topology decisions fixed by earlier iterations.
+        model0: Reusable MIP created by ``create_iterative_heuristic_model``.
+        cont_list: Contingency identifiers represented by ``model0``.
+        K_Opt: Maximum number of additional topology decisions to optimize.
+        print_result: Print detailed solution information when ``True``.
+
+    Returns:
+        A dictionary containing solve time, topology decisions, updated fixed
+        decisions, dispatch, optimality gap, costs, load shedding, and updated
+        voltage and angle linearization points.
     """
     
-    #======  data
-    
+    # Input data
     Sbase=data['Sbase']
     Max_MIPGap=data['Max_MIPGap']
-#     Max_timelimit=data['Max_timelimit']=600 #900
     Bus=data['Bus']    # for b in Bus
     busbar=data['busbar']
     branch=data['branch']
@@ -640,14 +655,12 @@ def Solve_MIP_v65(data,TopologyFix,model0,cont_list,K_Opt=1,print_result=False):
     BigM_busbar=data['BigM_busbar']
 
     
-    #======
-    
+    # Copy the reusable model.
     model=model0.copy()
     model.Params.OutputFlag=1
 
 
-#=============================== Equations ==================================================
-
+    # Fix previously accepted topology decisions.
     counter = 0
     for b in Bus:
         if b in TopologyFix['bus'].keys():
@@ -687,7 +700,7 @@ def Solve_MIP_v65(data,TopologyFix,model0,cont_list,K_Opt=1,print_result=False):
         print('counter is: ',counter)
 
 
-    # long cut
+    # Limit the number of additional topology changes.
     model.addConstr((  quicksum( (1- model.getVarByName('z_bus['+str(b)+']') ) for b in Bus)
                      + quicksum( model.getVarByName('z_li['+str(l)+','+str(i)+','+str(j)+']')   for l,i,j in Lines  ) 
                       + quicksum( model.getVarByName('z_g['+str(g)+']') for g in G)
@@ -695,21 +708,14 @@ def Solve_MIP_v65(data,TopologyFix,model0,cont_list,K_Opt=1,print_result=False):
                          <= counter + K_Opt) , name='eq_MaxSw_bus') 
 
 
-
-    
-
-
     model.update()
-    #model.write('BCC_Benders_v4_OSP.lp')
     start_time = time.time()
     model.optimize()
     end_time = time.time()
     ex_time=end_time-start_time 
 
 
-    
-    
-    #===================== infeasibility debug
+    # Solve the refinement problem.
     
     status = model.Status
 
@@ -718,13 +724,11 @@ def Solve_MIP_v65(data,TopologyFix,model0,cont_list,K_Opt=1,print_result=False):
         print('\n\nOptimization was stopped with infeasibility!')
         
 
-        # Relax the bounds and try to make the model feasible
+        # Relax bounds to diagnose an infeasible model.
         print('\n\nThe model is infeasible; relaxing the bounds\n\n')
         orignumvars = model.NumVars
-        # relaxing only variable bounds
+        # Relax only variable bounds.
         model.feasRelaxS(0, False, True, False)
-        # for relaxing variable bounds and constraint bounds use
-        # model.feasRelaxS(0, False, True, True)
 
         model.optimize()
 
@@ -732,12 +736,10 @@ def Solve_MIP_v65(data,TopologyFix,model0,cont_list,K_Opt=1,print_result=False):
         if status in (GRB.INF_OR_UNBD, GRB.INFEASIBLE, GRB.UNBOUNDED):
                 print('The relaxed model cannot be solved \
                        because it is infeasible or unbounded')
-        #sys.exit(1)
         if status != GRB.OPTIMAL:
             print('Optimization was stopped with status %d' % status)
-#             sys.exit(1)
 
-        # print the values of the artificial variables of the relaxation
+        # Report artificial variables introduced by the relaxation.
         print('\nSlack values:')
         slacks = model.getVars()[orignumvars:]
         for sv in slacks:
@@ -745,17 +747,8 @@ def Solve_MIP_v65(data,TopologyFix,model0,cont_list,K_Opt=1,print_result=False):
                 print('%s = %g' % (sv.VarName, sv.X))
     
     
- 
+    # Report results.
 
-    # =======================================================================================================================
-    # =======================================================================================================================
-    # ======================================== Report Result ================================= 
-
-    
-    
-    
-    
-    
     
     ShedCost_df = pd.DataFrame(columns=['ShedCost(c)'],index=cont_list, dtype=float)
     PdShed_dic = pd.DataFrame(columns=['shed'],index=pd.MultiIndex.from_product([DemandSet,busbar,cont_list]), dtype=float)
@@ -766,19 +759,11 @@ def Solve_MIP_v65(data,TopologyFix,model0,cont_list,K_Opt=1,print_result=False):
                 PdShed_dic.loc[d,i,c]=model.getVarByName('Pdi_Shed['+str(d)+','+str(i)+','+str(c)+']').x 
 
 
-    
-    
-        
-    
-    
     if print_result==True:
         
         ex_time_df=pd.DataFrame(data=ex_time,index=['Time'],columns=['Time'])
         print('Execution Time', ex_time_df)
 
-        
-        
-                
         
         OF_df = pd.DataFrame(columns=['OF'],data=[model.getVarByName('OF').x])
         GenCost_df = pd.DataFrame(columns=['GenCost'],data=[model.getVarByName('GenCost').x])
@@ -786,26 +771,13 @@ def Solve_MIP_v65(data,TopologyFix,model0,cont_list,K_Opt=1,print_result=False):
         TotalShedCost_df= pd.DataFrame(columns=['TotalShedCost'],data=[model.getVarByName('TotalShedCost').x])
 
         
-        
-  
-        
-        
         print('\n\n ======================= Results ======================= \n ')
         print('# Objective:',OF_df )
         print('# Gen Cost: ',GenCost_df )
         print('# RD Cost :',RDCost_df)
-        # print('# Total Shedding Cost: %.3f'%(TotalShedCost.x))
-        # if TotalShedCost.x!=0:
-        #     print('Average Shedding over %i contingency : %.3f MW' %( len(cont_list)-1,  100*(ShedCost_df.values.sum())/(len(cont_list)-1)  ) )
-            # print('Average: ',ShedCost_df.values/ShedCost_df.value_counts)
-#         display('# Shedding cost',ShedCost_df)
         
 
-                    
-                
-    # ====================================================================================
-    
-    # Build the Topology dictionary
+    # Build the topology dictionary.
     
     z_bus_dict={}; z_g_dict={}; z_d_dict={}; z_li_dict={}
     
@@ -846,26 +818,24 @@ def Solve_MIP_v65(data,TopologyFix,model0,cont_list,K_Opt=1,print_result=False):
         if z_li_dict[(l,i,j)]==1:
             TopologyFix_updated['l_i'][(l,i,j)] =  z_li_dict[(l,i,j)]
 
-    # print(TopologyFix_updated)
 
-
-
-    
- 
-            
-    # Fix pre-contingency dispatch
+    # Extract pre-contingency dispatch.
             
     Pg_dict = {}; Qg_dict = {}
     for g in G:
         Pg_dict[g] = model.getVarByName('Pg['+str(g)+']').x
         Qg_dict[g] =model.getVarByName('Qg['+str(g)+']').x
-        # print(g,Pg_dict[g])
-    
-    
-    
-    
+
+    Vol0_li = {}
+    delta0_li = {}
+    for l,i,j in Lines:
+        for c in cont_list:
+            suffix = '['+str(l)+','+str(i)+','+str(j)+','+str(c)+']'
+            Vol0_li[l,i,j,c] = np.sqrt(model.getVarByName('V2_li'+suffix).x)
+            delta0_li[l,i,j,c] = model.getVarByName('delta_li'+suffix).x
 
     
+    # Results
     return {
         'time':ex_time,
         'TopologyDict':TopologyDict,
@@ -877,32 +847,76 @@ def Solve_MIP_v65(data,TopologyFix,model0,cont_list,K_Opt=1,print_result=False):
         'GenCost':model.getVarByName('GenCost').x,
         'TotalShedCost':model.getVarByName('TotalShedCost').x,
         'ShedCost_df':ShedCost_df,
-        'PdShed_dic':PdShed_dic
+        'PdShed_dic':PdShed_dic,
+        'Vol0_li':Vol0_li,
+        'delta0_li':delta0_li
         }
     
     
+def SC_SR_1OptH(
+    data,
+    cont_list=None,
+    K_Opt=1,
+    Max_iteration=10000,
+    Max_Sw_bus=0,
+    Up_redispatch=0,
+    Dn_redispatch=1.0,
+    Zfixdict=None,
+    Zinitial=None,
+    PQgFix=None,
+    PgFix=None,
+    FixedCost=False,
+    Alpha=0,
+    Pg_market=None,
+    Probabilistic=False,
+    SolverTime=600,
+    Threads=None,
+    line_shedding=True,
+    Vol0_li=None,
+    delta0_li=None,
+    print_result=False,
+):
+    """Run the iterative topology-fixing heuristic to convergence.
 
-# %% main iterative heuristic function
+    Args:
+        data: Network and model-parameter dictionary returned by
+            ``read_data_AC``.
+        cont_list: Security contingencies; normal operation is added internally.
+        K_Opt: Maximum number of new topology decisions optimized per iteration.
+        Max_iteration: Maximum number of topology-refinement iterations.
+        Max_Sw_bus: Maximum number of busbar-splitting actions allowed.
+        Up_redispatch: Fraction of generator capacity available for upward
+            active-power redispatch.
+        Dn_redispatch: Fraction of generator capacity available for downward
+            active-power redispatch.
+        Zfixdict: Optional dictionary of topology variables to fix.
+        Zinitial: Optional initial topology used as a Gurobi warm start.
+        PQgFix: Optional busbar-level active and reactive generation to fix.
+        PgFix: Optional total active-generation values to fix.
+        FixedCost: Enforce the market-generation cost limit when ``True``.
+        Alpha: Relative margin applied to the market-generation cost limit.
+        Pg_market: Reference market dispatch used by the fixed-cost constraint.
+        Probabilistic: Weight contingency shedding costs by their probabilities
+            when ``True``.
+        SolverTime: Gurobi time limit per solve in seconds.
+        Threads: Optional number of Gurobi solver threads.
+        line_shedding: Line-shedding configuration flag retained from the case
+            study interface.
+        Vol0_li: Optional branch-voltage linearization points.
+        delta0_li: Optional branch-angle linearization points.
+        print_result: Print detailed solution information when ``True``.
 
-def BCC_v65_AC_iterative_heuristic(data,cont_list=None,
-                                   K_Opt=1, #sw change in each iteration
-                                   Max_iteration=10000,
-                                        Max_Sw_bus=0,
-                                    Up_redispatch=0,Dn_redispatch=1.0,
-                                           Zfixdict=None,#fixed topology
-                                    Zinitial=None,
-                                   PQgFix=None, PgFix=None,
-                                   FixedCost=False,Alpha=0,Pg_market=None,
-                                   Probabilistic=False,
-                                    SolverTime=600,Threads=None,
-                                    line_shedding=True,
-                                     Vol0_li=None,
-                                           print_result=False):
+    Returns:
+        A dictionary containing iteration histories, the final cost and
+        dispatch, load shedding, and total solution time.
+    """
     
 
+    # Include normal operation in the modeled states.
     cont_list = cont_list + [0]
 
-    model0 = Create_v65_AC_MIP(data=data,cont_list=cont_list,
+    # Build one reusable model for all refinement iterations.
+    model0 = create_iterative_heuristic_model(data=data,cont_list=cont_list,
                                         Max_Sw_bus=Max_Sw_bus,
                                     Up_redispatch=Up_redispatch,Dn_redispatch=Dn_redispatch,
                                            Zfixdict=Zfixdict,#fixed topology
@@ -912,11 +926,11 @@ def BCC_v65_AC_iterative_heuristic(data,cont_list=None,
                                    Probabilistic=Probabilistic,
                                     SolverTime=SolverTime,Threads=Threads,
                                     line_shedding=line_shedding,
-                                     Vol0_li=Vol0_li )
+                                     Vol0_li=Vol0_li,
+                                     delta0_li=delta0_li )
     
 
-
-
+    # Initially, no topology decisions are fixed.
     TopologyFix = {
         'bus':{},
         'g':{},
@@ -935,14 +949,13 @@ def BCC_v65_AC_iterative_heuristic(data,cont_list=None,
     tot_time=0; 
 
    
-
-
     TopologyFix_updated = TopologyFix.copy()
 
+    # Iterative topology-refinement loop
     for iter in tqdm(range(Max_iteration)):
 
 
-        res = Solve_MIP_v65(data=data,TopologyFix=TopologyFix_updated,model0=model0,cont_list=cont_list,K_Opt=K_Opt,print_result=print_result)
+        res = solve_iterative_heuristic_iteration(data=data,TopologyFix=TopologyFix_updated,model0=model0,cont_list=cont_list,K_Opt=K_Opt,print_result=print_result)
 
 
         TopologyFix_updated = res['TopologyFix_updated']
@@ -956,6 +969,7 @@ def BCC_v65_AC_iterative_heuristic(data,cont_list=None,
         GenCost_k[iter] = res['GenCost']
 
 
+        # Stop when the objective no longer improves materially.
         if UB < UB_min*0.999:
             UB_min = UB
             print('iter %i, UB: %.2f'%(iter,UB))
@@ -967,12 +981,7 @@ def BCC_v65_AC_iterative_heuristic(data,cont_list=None,
             print('time is up at %i, terminate!'%tot_time)
 
 
-
-    
-
-
-
-
+    # Results
     return {
         'time_iteration':time_iteration,
          'TopologyDict_k':Topology_k,
@@ -985,5 +994,7 @@ def BCC_v65_AC_iterative_heuristic(data,cont_list=None,
         'Qg':res['Qg'],
         'ShedCost_df':res['ShedCost_df'],
         'PdShed_dic':res['PdShed_dic'],
+        'Vol0_li':res['Vol0_li'],
+        'delta0_li':res['delta0_li'],
         'time':tot_time,
     }

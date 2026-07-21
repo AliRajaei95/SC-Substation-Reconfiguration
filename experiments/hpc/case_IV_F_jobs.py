@@ -3,12 +3,12 @@ import subprocess
 
 
 sw_list = [0,1,2]
-alpha_list = [0,0.1,0.2,0.3,0.4,0.5]
+alpha_list = [0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0]
 
 
 dem=1.0
 lm=1
-lc=0
+lc=19
 prob=0.05
 
 
@@ -40,14 +40,14 @@ print('alpha is:',{alpha})
 data=read_data_AC(File=data_file,DemFactor=dem,LineLimit=lm,busbar_prob={prob},print_data=False)
 
 coupler_cont=data['coupler_cont']; busbar_cont = data['busbar_cont']
-line_cont = [] #data['line_cont_notradial']
+line_cont = data['line_cont_notradial']
 lc = len(line_cont)
 
 
-Pg_market=AC_SC_OPF_lp(data=data,cont_list=line_cont,print_result=True)['Pg']
+Pg_market=solve_ac_sc_opf(data=data,cont_list=line_cont,print_result=True)['Pg']
 
 
-res = BCC_v60_AC_full(data=data,
+res = SC_SR_OrgMIP(data=data,
                         cont_list=line_cont +busbar_cont+coupler_cont,
                         Zfixdict=None,
                         FixedCost=True,Pg_market=Pg_market,Alpha={alpha},

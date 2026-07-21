@@ -1,71 +1,46 @@
-"""Fixed-topology large-system baseline from the Section IV-A case study.
+"""Fixed-topology large-system baseline for Section IV-D-2.
 
-This specialized implementation evaluates the PEGASE 1354-bus system without
-busbar splitting, reducing the model size for the large-network comparison.
+Org-MIP is intractable for the PEGASE 1354-bus case and encounters an
+out-of-memory error even on a system with 1 TB of RAM. This baseline obtains an
+initial solution by fixing the topology to T_0, solving security-constrained
+OPF for line contingencies, and evaluating load shedding under busbar
+contingencies.
 """
 
-# %% [markdown]
-# # Busbar Coupler Contingency (BCC) Project
-#  
-# **The proposed approach with linear AC**
-# 
-# **MP1: normal dispatch**
-# - **FSP1: feasibility of line contingency**
-# **MP2: find each substation configuration (parallel)**
-# **OSP1: substation-contingency with load shedding.**
-# - Problem: load shedding can help when active overloading is happening. However, if the generators have negative Qg, load shedding cannot help and we may encounter infeasibility problems. That's why we allow redisptaching Qg in contingencies.
-# 
-# - OSP-2:we allow line shedding here!
-# 
-# 
-# 
-# 
-# 
-
-# %% [markdown]
-# # Especially designed for no busbar splitting, PEGASE 1354-bus
-# # No MP2, we fix the dispatch and default topology, we evaluate with OSP
-
-# %%
-# Libraries
-#%reset 
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-from itertools import combinations
-import itertools
 import gurobipy as gp
 from gurobipy import GRB
 from gurobipy import quicksum
-import networkx as nx
 import time
-from copy import deepcopy
-import random
-import sys
 from tqdm import tqdm
-import pickle
 
 from .original_MIP_model import *  # Shared data preparation and AC-OPF utilities.
 
+# Originally tested with Python 3.7 and Gurobi 10.0.3.
 
 
-# from BCC_Plot_Topology_v1 import plot_topology_v1
+def create_fixed_1354_line_fsp(
+    data,
+    cont_list=None,
+    Vol0_li=None,
+    delta0_li=None,
+):
+    """Build the fixed-topology line-contingency feasibility subproblem.
 
+    Args:
+        data: Network and model-parameter dictionary returned by
+            ``read_data_AC``.
+        cont_list: Normal-state and non-radial line contingencies to model.
+        Vol0_li: Optional branch-voltage linearization points; unit values are
+            used when omitted.
+        delta0_li: Optional branch-angle linearization points; zero values are
+            used when omitted.
 
-# tested with Python 3.7.0 & Gurobi 10.0.3
-
-# %%
-
-
-# %% [markdown]
-# # BCC Feasibility-SP: non-radial line contingencies
-
-# %%
-def create_FSP_line_v65(data,cont_list=None):
-    
-    """This FSP-1 should only include line contingencies, without any load shedding and re-disptach.
-    However, other contingency formulations have not been removed.
-    Here we only use this function for normal operation or non-radial line contingencies."""
+    Returns:
+        A dictionary containing the reusable unsolved model and model-size
+        statistics.
+    """
     
     
     #======  data
@@ -90,8 +65,11 @@ def create_FSP_line_v65(data,cont_list=None):
     
     model=gp.Model('BCC Benders FSP-1')
     
-    cont_list=cont_list.copy()   
-    #cont_list+=[0]             
+    cont_list=cont_list.copy()
+    if Vol0_li is None:
+        Vol0_li={(l,i,j,c):1.0 for l,i,j in Lines for c in cont_list}
+    if delta0_li is None:
+        delta0_li={(l,i,j,c):0.0 for l,i,j in Lines for c in cont_list}
         
    
     model.Params.OutputFlag=0
@@ -108,6 +86,13 @@ def create_FSP_line_v65(data,cont_list=None):
 
     Pflow=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Pflow')         
     Qflow=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qflow')         
+    Ploss=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Ploss')
+    Qloss=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qloss')
+    Ploss_vol=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Ploss_vol')
+    Qloss_vol=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qloss_vol')
+    Ploss_delta=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Ploss_delta')
+    Qloss_delta=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qloss_delta')
+    epsilon=model.addVars(Lines,cont_list,lb=0,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='epsilon')
     
     
     delta=model.addVars(Bus,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='delta') 
@@ -176,16 +161,38 @@ def create_FSP_line_v65(data,cont_list=None):
 
     model.addConstrs( (  Pflow[l,i,j,c] == 
     0.5*branch.loc[(l,i,j)]['g_ij']*( V2[i,c] - V2[j,c] )
-    -branch.loc[(l,i,j)]['b_ij']*(delta[i,c]-delta[j,c] ) 
+    -branch.loc[(l,i,j)]['b_ij']*(delta[i,c]-delta[j,c] ) + Ploss[l,i,j,c]
                             for l,i,j in Lines
                            for c in cont_list if l!=c   ) , name='eqPij')
     
     model.addConstrs( (  Qflow[l,i,j,c] == 
     -0.5*branch.loc[(l,i,j)]['b_ij']*(V2[i,c] - V2[j,c])
-    -branch.loc[(l,i,j)]['g_ij']*(delta[i,c]-delta[j,c]) 
+    -branch.loc[(l,i,j)]['g_ij']*(delta[i,c]-delta[j,c]) + Qloss[l,i,j,c]
                             for l,i,j in Lines
                            for c in cont_list if l!=c    ) , name='eqQij')
-    
+    # Linearized branch-loss equations
+    model.addConstrs((Ploss[l,i,j,c] == Ploss_vol[l,i,j,c] + Ploss_delta[l,i,j,c]
+                      for l,i,j in Lines for c in cont_list if l!=c), name='eqPloss_total')
+    model.addConstrs((Qloss[l,i,j,c] == Qloss_vol[l,i,j,c] + Qloss_delta[l,i,j,c]
+                      for l,i,j in Lines for c in cont_list if l!=c), name='eqQloss_total')
+    model.addConstrs((0 <= Ploss[l,i,j,c] + epsilon[l,i,j,c]
+                      for l,i,j in Lines for c in cont_list if l!=c), name='eqPloss_pos')
+    model.addConstrs((Ploss_vol[l,i,j,c] ==
+                      branch.loc[(l,i,j)]['g_ij']*((Vol0_li[l,i,j,c]-Vol0_li[l,j,i,c])/(Vol0_li[l,i,j,c]+Vol0_li[l,j,i,c]))*(V2[i,c]-V2[j,c])
+                      -0.5*branch.loc[(l,i,j)]['g_ij']*(Vol0_li[l,i,j,c]-Vol0_li[l,j,i,c])**2
+                      for l,i,j in Lines for c in cont_list if l!=c), name='eqPloss_vol')
+    model.addConstrs((Qloss_vol[l,i,j,c] ==
+                      -branch.loc[(l,i,j)]['b_ij']*((Vol0_li[l,i,j,c]-Vol0_li[l,j,i,c])/(Vol0_li[l,i,j,c]+Vol0_li[l,j,i,c]))*(V2[i,c]-V2[j,c])
+                      +0.5*branch.loc[(l,i,j)]['b_ij']*(Vol0_li[l,i,j,c]-Vol0_li[l,j,i,c])**2
+                      for l,i,j in Lines for c in cont_list if l!=c), name='eqQloss_vol')
+    model.addConstrs((Ploss_delta[l,i,j,c] ==
+                      branch.loc[(l,i,j)]['g_ij']*(delta0_li[l,i,j,c]-delta0_li[l,j,i,c])*(delta[i,c]-delta[j,c])
+                      -0.5*branch.loc[(l,i,j)]['g_ij']*(delta0_li[l,i,j,c]-delta0_li[l,j,i,c])**2
+                      for l,i,j in Lines for c in cont_list if l!=c), name='eqPloss_delta')
+    model.addConstrs((Qloss_delta[l,i,j,c] ==
+                      -branch.loc[(l,i,j)]['b_ij']*(delta0_li[l,i,j,c]-delta0_li[l,j,i,c])*(delta[i,c]-delta[j,c])
+                      +0.5*branch.loc[(l,i,j)]['b_ij']*(delta0_li[l,i,j,c]-delta0_li[l,j,i,c])**2
+                      for l,i,j in Lines for c in cont_list if l!=c), name='eqQloss_delta')
  
 
 
@@ -236,18 +243,31 @@ def create_FSP_line_v65(data,cont_list=None):
     
 
 # %%
-def solve_FSP_line_v65(data,TopologyMP,model0,cont_list,
-                                    print_result=False):
-    
-    """This FSP-1 should only include line contingencies, without any load shedding and re-disptach.
-    However, other contingency formulations have not been removed.
-    Here we only use this function for normal operation or non-radial line contingencies."""
+def solve_fixed_1354_line_fsp(
+    data,
+    TopologyMP,
+    model0,
+    cont_list,
+    print_result=False,
+):
+    """Solve a prepared line-contingency feasibility subproblem.
+
+    Args:
+        data: Network and model-parameter dictionary.
+        TopologyMP: Fixed topology and dispatch supplied by the master problem.
+        model0: Reusable FSP returned by ``create_fixed_1354_line_fsp``.
+        cont_list: Contingencies represented by ``model0``.
+        print_result: Print the feasibility objective when ``True``.
+
+    Returns:
+        Linking duals, objective value, solve time, and updated voltage and
+        angle linearization points.
+    """
     
     
     #======  data
     
 
-#     Max_timelimit=data['Max_timelimit']=600 #900
     Bus=data['Bus']    # for b in Bus
     busbar=data['busbar']
     Lines=data['Lines']
@@ -281,7 +301,6 @@ def solve_FSP_line_v65(data,TopologyMP,model0,cont_list,
     if status == GRB.INFEASIBLE:
         print('\n\nFSP Optimization was stopped with infeasibility!')
         
-#         display(TopologyMP)
         
 
         # Relax the bounds and try to make the model feasible
@@ -289,8 +308,6 @@ def solve_FSP_line_v65(data,TopologyMP,model0,cont_list,
         orignumvars = model.NumVars
         # relaxing only variable bounds
         model.feasRelaxS(0, False, True, False)
-        # for relaxing variable bounds and constraint bounds use
-        # model.feasRelaxS(0, False, True, True)
 
         model.optimize()
 
@@ -298,10 +315,8 @@ def solve_FSP_line_v65(data,TopologyMP,model0,cont_list,
         if status in (GRB.INF_OR_UNBD, GRB.INFEASIBLE, GRB.UNBOUNDED):
                 print('The relaxed model cannot be solved \
                        because it is infeasible or unbounded')
-        #sys.exit(1)
         if status != GRB.OPTIMAL:
             print('Optimization was stopped with status %d' % status)
-#             sys.exit(1)
 
         # print the values of the artificial variables of the relaxation
         print('\nSlack values:')
@@ -326,21 +341,24 @@ def solve_FSP_line_v65(data,TopologyMP,model0,cont_list,
         'Qg':MuQg
     }
     
-    # for l,i,j in Lines:
-    #     for c in cont_list:
-    #         print(l,i,j,c,' : %.2f'%model.getVarByName('Pflow['+str(l)+','+str(i)+','+str(j)+','+str(c)+']').x     )
-
-
     if print_result==True:
         
         print(model.getVarByName('OF_FSP').x)
  
         
-    return { 
+    Vol0_li = {}
+    delta0_li = {}
+    for l,i,j in Lines:
+        for c in cont_list:
+            Vol0_li[l,i,j,c] = np.sqrt(model.getVarByName('V2['+str(i)+','+str(c)+']').x)
+            delta0_li[l,i,j,c] = model.getVarByName('delta['+str(i)+','+str(c)+']').x
+
+    return {
         'Mu':Mu,
         'time':ex_time,
-        #'z_lineZc':z_lineZc_df,
-        'OF_FSP': model.getVarByName('OF_FSP').x         
+        'OF_FSP': model.getVarByName('OF_FSP').x,
+        'Vol0_li':Vol0_li,
+        'delta0_li':delta0_li
     }
     
     
@@ -353,21 +371,39 @@ def solve_FSP_line_v65(data,TopologyMP,model0,cont_list,
 # # OSP substation
 
 # %%
-def create_OSP_substation_v65(data,substation,cont_list=None,
-                                    Up_redispatch=0,Dn_redispatch=1.0,
-                           Max_Sw_bus=0):
-    
-    """OSP for a fixed topology and a given contingency set.
-    OSP cost comes from load shedding.
-    con_list should be [sub,sub-1,sub-2]
-    
+def create_fixed_1354_substation_osp(
+    data,
+    substation,
+    cont_list=None,
+    Up_redispatch=0,
+    Dn_redispatch=1.0,
+    Max_Sw_bus=0,
+    Vol0_li=None,
+    delta0_li=None,
+):
+    """Build the fixed-topology contingency optimality subproblem.
+
+    Args:
+        data: Network and model-parameter dictionary.
+        substation: Substation represented with explicit busbar variables.
+        cont_list: Contingencies evaluated by the model.
+        Up_redispatch: Available upward active-power redispatch fraction.
+        Dn_redispatch: Available downward active-power redispatch fraction.
+        Max_Sw_bus: Switching limit retained for interface compatibility.
+        Vol0_li: Optional branch-voltage linearization points; unit values are
+            used when omitted.
+        delta0_li: Optional branch-angle linearization points; zero values are
+            used when omitted.
+
+    Returns:
+        A dictionary containing the reusable unsolved model and model-size
+        statistics.
     """
     
     #======  data
     
     Sbase=data['Sbase']
     Max_MIPGap=data['Max_MIPGap']
-#     Max_timelimit=data['Max_timelimit']=600 #900
     Bus=data['Bus']    # for b in Bus
     busbar=data['busbar']
     branch=data['branch']
@@ -397,7 +433,11 @@ def create_OSP_substation_v65(data,substation,cont_list=None,
     
     model=gp.Model('OSP-v65')
     
-    cont_list=cont_list.copy() 
+    cont_list=cont_list.copy()
+    if Vol0_li is None:
+        Vol0_li={(l,i,j,c):1.0 for l,i,j in Lines for c in cont_list}
+    if delta0_li is None:
+        delta0_li={(l,i,j,c):0.0 for l,i,j in Lines for c in cont_list}
 
     model.Params.OutputFlag=0
 
@@ -443,6 +483,13 @@ def create_OSP_substation_v65(data,substation,cont_list=None,
     Pflow_li=model.addVars(Lines_sub,busbar,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Pflow_li')
     Qflow=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qflow')         
     Qflow_li=model.addVars(Lines_sub,busbar,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qflow_li')
+    Ploss=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Ploss')
+    Qloss=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qloss')
+    Ploss_vol=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Ploss_vol')
+    Qloss_vol=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qloss_vol')
+    Ploss_delta=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Ploss_delta')
+    Qloss_delta=model.addVars(Lines,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qloss_delta')
+    epsilon=model.addVars(Lines,cont_list,lb=0,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='epsilon')
     
     Pflow_bus=model.addVars(Bus_sub,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Pflow_bus')  #From b1 to b2!
     Qflow_bus=model.addVars(Bus_sub,cont_list,lb=-GRB.INFINITY,ub=GRB.INFINITY,vtype=GRB.CONTINUOUS,name='Qflow_bus')  #From b1 to b2!
@@ -460,7 +507,6 @@ def create_OSP_substation_v65(data,substation,cont_list=None,
  
 
     OF_OSP=model.addVar(lb=0,vtype=GRB.CONTINUOUS,name='OF_OSP')             # obj func var
-    #GenCost=model.addVar(lb=0,vtype=GRB.CONTINUOUS,name='GenCost')
     RDCost=model.addVar(lb=0,vtype=GRB.CONTINUOUS,name='RDCost')
     ShedCost=model.addVars(cont_list,lb=0,vtype=GRB.CONTINUOUS,name='ShedCost')
     TotalShedCost=model.addVar(lb=0,vtype=GRB.CONTINUOUS,name='TotalShedCost')
@@ -472,28 +518,12 @@ def create_OSP_substation_v65(data,substation,cont_list=None,
     # Binary Equations ==================================================
 
     # Reliability switching 
-    # eq_2line_busbar2=model.addConstrs(( 2*(1-z_bus[b]) <= 
-    #                                quicksum(z_li[l,i,j] for l,i,j in Lines.select('*',b,'*')) 
-    #                         for b in Bus_sub ), name='eq_2line_busbar2' ) 
-    # eq_2line_busbar1=model.addConstrs(( 2*(1-z_bus[b]) <= 
-    #                                quicksum(1-z_li[l,i,j] for l,i,j in Lines.select('*',b,'*')) 
-    #                         for b in Bus_sub ), name='eq_2line_busbar1' )
-    
-    
-    # eq_2line_busbar3=model.addConstrs(( z_bus[b] == 1 
-    #                         for b in Bus_sub
-    #                          if NumberL2B[b]<=3  ), name='eq_2line_busbar3' )
-    
-    # # max Switching ================
-    # eq_MaxSw_bus=model.addConstr((  quicksum( (1-z_bus[b]) for b in Bus_sub) <= Max_Sw_bus) , name='eq_MaxSw_bus')        
-    
     # symmetry 
     for b in Bus_sub:
         lmin,b=L2B.select('*',b)[0]
         lmin,i,j=Lines.select(lmin,b,'*')[0]
         eq_symmetry1=model.addConstr((  z_li[lmin,i,j] ==0  ), name='eq_symmetry1')
 
-    # eq_zbus_ref=model.addConstr( (  z_bus[Bus_sub[0]]==1    ), name='eq_zbus_ref')
     model.addConstr( (  z_bus[substation]==1    ), name='eq_zbus_ref')
 
     
@@ -525,19 +555,11 @@ def create_OSP_substation_v65(data,substation,cont_list=None,
                           for g in G_sub for i in busbar for c in cont_list ),name='Eq_dPgUp_res')
     Eq_dPgDn_res=model.addConstrs(( dPgi_dn[g,i,c] <= Gen_data.loc[g]['Pmax']*Dn_redispatch  
                             for g in G_sub for i in busbar for c in cont_list ),name='Eq_dPgDn_res')
-    # model.addConstrs(( dPgi_up[g,i,c] == 0  
-    #                       for g in G_sub for i in busbar for c in cont_list if c==0 ),name='Eq_dPg0')
-    # model.addConstrs(( dPgi_dn[g,i,c] == 0  
-    #                         for g in G_sub for i in busbar for c in cont_list if c==0 ),name='Eq_dPgDn_res')
     
     Eq_dQgUp_res=model.addConstrs(( dQgi_up[g,i,c] <= Gen_data.loc[g]['Qmax']*1 #*Up_redispatch  
                           for g in G_sub for i in busbar for c in cont_list ),name='Eq_dQgUp_res')
     Eq_dQgDn_res=model.addConstrs(( dQgi_dn[g,i,c] <= Gen_data.loc[g]['Qmax']*1 #Dn_redispatch  
                             for g in G_sub for i in busbar for c in cont_list ),name='Eq_dQgDn_res')
-    # model.addConstrs(( dQgi_up[g,i,c] == 0  
-    #                       for g in G_sub for i in busbar for c in cont_list if c==0 ),name='Eq_dQg0')
-    # model.addConstrs(( dQgi_dn[g,i,c] == 0  
-    #                         for g in G_sub for i in busbar for c in cont_list if c==0 ),name='Eq_dQgDn_res')
 
     
 
@@ -558,19 +580,11 @@ def create_OSP_substation_v65(data,substation,cont_list=None,
                           for g in G_non_sub for c in cont_list ),name='Eq_dPgUp_res')
     model.addConstrs(( dPg_dn[g,c] <= Gen_data.loc[g]['Pmax']*Dn_redispatch  
                             for g in G_non_sub for c in cont_list ),name='Eq_dPgDn_res')
-    # model.addConstrs(( dPg_up[g,c] == 0  
-    #                       for g in G_non_sub for c in cont_list if c==0 ),name='Eq_dPg0')
-    # model.addConstrs(( dPg_dn[g,c] == 0  
-    #                         for g in G_non_sub for c in cont_list if c==0 ),name='Eq_dPgDn_res')
     
     model.addConstrs(( dQg_up[g,c] <= Gen_data.loc[g]['Qmax']*1 #*Up_redispatch  
                           for g in G_non_sub for c in cont_list ),name='Eq_dQgUp_res')
     model.addConstrs(( dQg_dn[g,c] <= Gen_data.loc[g]['Qmax']*1 #Dn_redispatch  
                             for g in G_non_sub for c in cont_list ),name='Eq_dQgDn_res')
-    # model.addConstrs(( dQg_up[g,c] == 0  
-    #                       for g in G_non_sub for c in cont_list if c==0 ),name='Eq_dQg0')
-    # model.addConstrs(( dQg_dn[g,c] == 0  
-    #                         for g in G_non_sub for c in cont_list if c==0 ),name='Eq_dQgDn_res')
 
 
 
@@ -596,10 +610,6 @@ def create_OSP_substation_v65(data,substation,cont_list=None,
     model.addConstrs( (  Pdi_Shed[d,i,c]<=Pdi[d,i] 
                               for d in D_sub for i in busbar 
                                for c in cont_list) , name='eq_PdShedlimit')
-    # model.addConstrs( (  Pdi_Shed[d,i,c]==0 
-    #                           for d in D_sub for i in busbar 
-    #                            for c in cont_list
-    #                   if c==0) , name='eq_PdShedlimit0')
     
     model.addConstrs( (  Qdi_Shed[d,i,c]== (Pdemand.loc[d]['Qd'])/(Pdemand.loc[d]['Pd'])*Pdi_Shed[d,i,c]
                               for d in D_sub for i in busbar 
@@ -609,10 +619,6 @@ def create_OSP_substation_v65(data,substation,cont_list=None,
     model.addConstrs( (  Pd_Shed[d,c]<= Pdemand.loc[d]['Pd'] 
                                 for d in D_non_sub 
                                 for c in cont_list) , name='eq_PdShedlimit')
-    # model.addConstrs( (  Pd_Shed[d,c]==0 
-    #                             for d in D_non_sub 
-    #                             for c in cont_list
-    #                     if c==0) , name='eq_PdShedlimit0')
 
     model.addConstrs( (  Qd_Shed[d,c]== (Pdemand.loc[d]['Qd'])/(Pdemand.loc[d]['Pd'])*Pd_Shed[d,c]
                                 for d in D_non_sub  
@@ -689,19 +695,39 @@ def create_OSP_substation_v65(data,substation,cont_list=None,
 
     model.addConstrs( (  Pflow[l,i,j,c] == 
     0.5*branch.loc[(l,i,j)]['g_ij']*( V2_li[l,i,j,c] - V2_li[l,j,i,c] )
-    -branch.loc[(l,i,j)]['b_ij']*(delta_li[l,i,j,c]-delta_li[l,j,i,c]) #+ Ploss[l,i,j,c]
+    -branch.loc[(l,i,j)]['b_ij']*(delta_li[l,i,j,c]-delta_li[l,j,i,c]) + Ploss[l,i,j,c]
                             for l,i,j in Lines
                            for c in cont_list if l!=c   ) , name='eqPij')
     
-    # if c!=str(i+'-1') if c!=str(i+'-2') if c!=str(j+'-1') if c!=str(j+'-2')
-    
     model.addConstrs( (  Qflow[l,i,j,c] == 
     -0.5*branch.loc[(l,i,j)]['b_ij']*(V2_li[l,i,j,c] - V2_li[l,j,i,c])
-    -branch.loc[(l,i,j)]['g_ij']*(delta_li[l,i,j,c]-delta_li[l,j,i,c]) 
-#     -V2_li[l,i,j,c]*(branch.loc[(l,i,j)]['b']/2) #+ Qloss[l,i,j,c]
+    -branch.loc[(l,i,j)]['g_ij']*(delta_li[l,i,j,c]-delta_li[l,j,i,c]) + Qloss[l,i,j,c]
                             for l,i,j in Lines
                            for c in cont_list if l!=c  ) , name='eqQij')
-    
+    # Linearized branch-loss equations
+    model.addConstrs((Ploss[l,i,j,c] == Ploss_vol[l,i,j,c] + Ploss_delta[l,i,j,c]
+                      for l,i,j in Lines for c in cont_list if l!=c), name='eqPloss_total')
+    model.addConstrs((Qloss[l,i,j,c] == Qloss_vol[l,i,j,c] + Qloss_delta[l,i,j,c]
+                      for l,i,j in Lines for c in cont_list if l!=c), name='eqQloss_total')
+    model.addConstrs((0 <= Ploss[l,i,j,c] + epsilon[l,i,j,c]
+                      for l,i,j in Lines for c in cont_list if l!=c), name='eqPloss_pos')
+    model.addConstrs((Ploss_vol[l,i,j,c] ==
+                      branch.loc[(l,i,j)]['g_ij']*((Vol0_li[l,i,j,c]-Vol0_li[l,j,i,c])/(Vol0_li[l,i,j,c]+Vol0_li[l,j,i,c]))*(V2_li[l,i,j,c]-V2_li[l,j,i,c])
+                      -0.5*branch.loc[(l,i,j)]['g_ij']*(Vol0_li[l,i,j,c]-Vol0_li[l,j,i,c])**2
+                      for l,i,j in Lines for c in cont_list if l!=c), name='eqPloss_vol')
+    model.addConstrs((Qloss_vol[l,i,j,c] ==
+                      -branch.loc[(l,i,j)]['b_ij']*((Vol0_li[l,i,j,c]-Vol0_li[l,j,i,c])/(Vol0_li[l,i,j,c]+Vol0_li[l,j,i,c]))*(V2_li[l,i,j,c]-V2_li[l,j,i,c])
+                      +0.5*branch.loc[(l,i,j)]['b_ij']*(Vol0_li[l,i,j,c]-Vol0_li[l,j,i,c])**2
+                      for l,i,j in Lines for c in cont_list if l!=c), name='eqQloss_vol')
+    model.addConstrs((Ploss_delta[l,i,j,c] ==
+                      branch.loc[(l,i,j)]['g_ij']*(delta0_li[l,i,j,c]-delta0_li[l,j,i,c])*(delta_li[l,i,j,c]-delta_li[l,j,i,c])
+                      -0.5*branch.loc[(l,i,j)]['g_ij']*(delta0_li[l,i,j,c]-delta0_li[l,j,i,c])**2
+                      for l,i,j in Lines for c in cont_list if l!=c), name='eqPloss_delta')
+    model.addConstrs((Qloss_delta[l,i,j,c] ==
+                      -branch.loc[(l,i,j)]['b_ij']*(delta0_li[l,i,j,c]-delta0_li[l,j,i,c])*(delta_li[l,i,j,c]-delta_li[l,j,i,c])
+                      +0.5*branch.loc[(l,i,j)]['b_ij']*(delta0_li[l,i,j,c]-delta0_li[l,j,i,c])**2
+                      for l,i,j in Lines for c in cont_list if l!=c), name='eqQloss_delta')
+
 
     
     for b in Bus_non_sub:
@@ -774,7 +800,6 @@ def create_OSP_substation_v65(data,substation,cont_list=None,
                                     if c!=l), name='eq_V2_lb2Frmax')
 
     
-    # eq_delta_ref=model.addConstrs((delta_bi[Bus_sub[0],'busbar1',ll]==0     for ll in cont_list ), name='ref_bus_angle' )
     eq_delta_ref=model.addConstrs((delta_li[Lines[0][0],Lines[0][1],Lines[0][2] ,ll]==0     for ll in cont_list ), name='ref_bus_angle' ) 
  
 
@@ -897,7 +922,6 @@ def create_OSP_substation_v65(data,substation,cont_list=None,
 
     model.update()
 
-    # model.write('OSP_'+str(substation)+'.lp')
     
     
     
@@ -920,14 +944,29 @@ def create_OSP_substation_v65(data,substation,cont_list=None,
 
 
 # %%
-def solve_OSP_substation_v65(data,substation,TopologyMP,model0,cont_list=None):
-    
-    """OSP for a fixed topology and a given contingency set.
-    OSP cost comes from load shedding."""
+def solve_fixed_1354_substation_osp(
+    data,
+    substation,
+    TopologyMP,
+    model0,
+    cont_list=None,
+):
+    """Solve a prepared fixed-topology contingency subproblem.
+
+    Args:
+        data: Network and model-parameter dictionary.
+        substation: Substation represented explicitly in ``model0``.
+        TopologyMP: Fixed topology and dispatch supplied by the master problem.
+        model0: Reusable OSP returned by ``create_fixed_1354_substation_osp``.
+        cont_list: Contingencies represented by ``model0``.
+
+    Returns:
+        Linking duals, load-shedding results, solve time, and updated voltage
+        and angle linearization points.
+    """
     
     #======  data
     
-#     Max_timelimit=data['Max_timelimit']=600 #900
     Bus=data['Bus']    # for b in Bus
     busbar=data['busbar']
     Lines=data['Lines']
@@ -979,46 +1018,13 @@ def solve_OSP_substation_v65(data,substation,TopologyMP,model0,cont_list=None):
     
 
     model.update()
-    #model.write('BCC_Benders_v4_OSP.lp')
     start_time = time.time()
     model.optimize()
     end_time = time.time()
     ex_time=end_time-start_time 
     
 
-#     status = model.Status
-
-    
-#     if status == GRB.INFEASIBLE:
-#         print('\n\nMP2 was stopped with infeasibility!')
-#         print('cont list: ',cont_list)
-
-
-#         # Relax the bounds and try to make the model feasible
-#         print('\n\nThe model is infeasible; relaxing the bounds\n\n')
-#         orignumvars = model.NumVars
-#         # relaxing only variable bounds
-# #         model.feasRelaxS(0, False, True, False)
-#         # for relaxing variable bounds and constraint bounds use
-# #         model.feasRelaxS(0, False, True, True)
-#         model.feasRelaxS(0, False, False, True) #relaxing constraints
-#         model.optimize()
-#         status = model.Status
-#         if status in (GRB.INF_OR_UNBD, GRB.INFEASIBLE, GRB.UNBOUNDED):
-#                 print('The relaxed model cannot be solved \
-#                        because it is infeasible or unbounded')
-#         if status != GRB.OPTIMAL:
-#             print('Optimization was stopped with status %d' % status)
-
-#         # print the values of the artificial variables of the relaxation
-#         print('\nSlack values:')
-#         slacks = model.getVars()[orignumvars:]
-#         for sv in slacks:
-#             if sv.X > 1e-9:
-#                 print('%s = %g' % (sv.VarName, sv.X))
-
-
-    #=================================== Obtaining dual values! ============================================ 
+    # Extract linking-constraint dual values.
     
     
     MuPgi={}; MuQgi={}; Muz_bus={}; Muz_li={}; Muz_g={}; Muz_d={}
@@ -1079,13 +1085,22 @@ def solve_OSP_substation_v65(data,substation,TopologyMP,model0,cont_list=None):
 
         
     
-    return { 
+    Vol0_li = {}
+    delta0_li = {}
+    for l,i,j in Lines:
+        for c in cont_list:
+            suffix = '['+str(l)+','+str(i)+','+str(j)+','+str(c)+']'
+            Vol0_li[l,i,j,c] = np.sqrt(model.getVarByName('V2_li'+suffix).x)
+            delta0_li[l,i,j,c] = model.getVarByName('delta_li'+suffix).x
+
+    return {
         'Mu':Mu,
         'time':ex_time,
-        #'z_lineZc':z_lineZc_df,
         'OF_OSP': model.getVarByName('OF_OSP').x, 
         'ShedCost_df':ShedCost_df,
-                        'PdShed_dc':PdShed_dc
+        'PdShed_dc':PdShed_dc,
+        'Vol0_li':Vol0_li,
+        'delta0_li':delta0_li
     }
     
     
@@ -1101,17 +1116,51 @@ def solve_OSP_substation_v65(data,substation,TopologyMP,model0,cont_list=None):
 # # Main function
 
 # %%
-def BCC_1354_full_AC(data,line_cont_list=[],
-                            Max_iter=10,
-                              Max_FSP_iter=10,FSP_criteria=0,
-                               Pg_market_fix=None,
-                            Max_Sw_bus=0,Up_redispatch=0,Dn_redispatch=1.0):
+def SC_OPF_FixedTopology1354(
+    data,
+    line_cont_list=None,
+    Max_iter=10,
+    Max_FSP_iter=10,
+    FSP_criteria=0,
+    Pg_market_fix=None,
+    Max_Sw_bus=0,
+    Up_redispatch=0,
+    Dn_redispatch=1.0,
+    Vol0_li=None,
+    delta0_li=None,
+):
+    """Run the fixed-topology PEGASE 1354-bus baseline from Section IV-D-2.
+
+    The topology is fixed to T_0, SC-OPF is solved for line contingencies, and
+    load shedding is evaluated for busbar contingencies.
+
+    Args:
+        data: Network and model-parameter dictionary.
+        line_cont_list: Line contingencies included in the security analysis.
+        Max_iter: Maximum number of outer evaluation iterations.
+        Max_FSP_iter: Maximum number of feasibility-cut iterations.
+        FSP_criteria: Feasibility objective stopping tolerance.
+        Pg_market_fix: Optional fixed active-power market dispatch.
+        Max_Sw_bus: Switching limit; this baseline expects zero.
+        Up_redispatch: Available upward active-power redispatch fraction.
+        Dn_redispatch: Available downward active-power redispatch fraction.
+        Vol0_li: Optional branch-voltage linearization points; unit values are
+            used when omitted.
+        delta0_li: Optional branch-angle linearization points; zero values are
+            used when omitted.
+
+    Returns:
+        The fixed topology, dispatch, security costs, shedding, timing, and
+        updated voltage and angle linearization points.
+    """
+
+    if line_cont_list is None:
+        line_cont_list=[]
     
     #======  data
     
     Sbase=data['Sbase']
     Max_MIPGap=data['Max_MIPGap']
-#     Max_timelimit=data['Max_timelimit']=600 #900
     Bus=data['Bus']    # for b in Bus
     busbar=data['busbar']
     branch=data['branch']
@@ -1177,7 +1226,6 @@ def BCC_1354_full_AC(data,line_cont_list=[],
     
     model.addConstr( TotalPhi == quicksum(Phi_b[b] for b in Bus) + quicksum(Phi_l[l] for l in line_cont_list0)  
                     ,name='Eq_Phi')
-#     model.addConstr(OF_MP == GenCost + TotalPhi   ,name='Eq_OF_MP')
     
     OF_MP = GenCost + TotalPhi + quicksum(0.001*Gen_data.loc[g]['b']*Qg[g]*Qg[g] for g in G )
 
@@ -1247,6 +1295,11 @@ def BCC_1354_full_AC(data,line_cont_list=[],
         all_sub_cont_list+=[b,str(b+'-1'),str(b+'-2')]
             
     all_cont=all_sub_cont_list+line_cont_list #used for reporting LoadShedding_df
+    linearization_cont=[0]+all_cont
+    if Vol0_li is None:
+        Vol0_li={(l,i,j,c):1.0 for l,i,j in Lines for c in linearization_cont}
+    if delta0_li is None:
+        delta0_li={(l,i,j,c):0.0 for l,i,j in Lines for c in linearization_cont}
     
     ShedCost_df = pd.DataFrame(0,columns=['ShedCost(c)'],index=all_cont, dtype=float) #not including c0
     PdShed_dc = pd.DataFrame(0,columns=['shed'],index=pd.MultiIndex.from_product([DemandSet,all_cont]), dtype=float)
@@ -1271,7 +1324,12 @@ def BCC_1354_full_AC(data,line_cont_list=[],
 
 
     for c in line_cont_notradial:
-        FSP_models[c] = create_FSP_line_v65(data=data,cont_list=[c])['model']
+        FSP_models[c] = create_fixed_1354_line_fsp(
+            data=data,
+            cont_list=[c],
+            Vol0_li=Vol0_li,
+            delta0_li=delta0_li,
+        )['model']
     
         
     
@@ -1294,7 +1352,6 @@ def BCC_1354_full_AC(data,line_cont_list=[],
         k1=0
         for k1 in tqdm(range(Max_FSP_iter)):
             
-            # print('FSP iteration %3i'%k1)
         
             FSP_Objc=0
             FSP_Obj=0
@@ -1307,13 +1364,12 @@ def BCC_1354_full_AC(data,line_cont_list=[],
 
 
             for c in (line_cont_notradial):
-#                 print('\t\tcont %s'%(c),end='')
-                # result = BCC_AC_FSP_line_v61(data,FinalTopology,cont_list=[c],print_result=False)
 
 
-                result = solve_FSP_line_v65(data=data,TopologyMP=topology_default0,model0=FSP_models[c],
+                result = solve_fixed_1354_line_fsp(data=data,TopologyMP=topology_default0,model0=FSP_models[c],
                                             cont_list=[c],print_result=False) #Problem: should we check default topology for disptach, or the new one?!
-                #TopologyMP=FinalTopology
+                Vol0_li.update(result['Vol0_li'])
+                delta0_li.update(result['delta0_li'])
                 FSP_Objc=result['OF_FSP']
                 FSP_Obj+=FSP_Objc
                 Lambda=result['Mu']
@@ -1354,7 +1410,6 @@ def BCC_1354_full_AC(data,line_cont_list=[],
      
                     
             else:
-                # print('\n\t\tFSP converged in iteration %i'%k1)
                 break
                 
             # end FSP1 loop =========================================================================================
@@ -1367,14 +1422,17 @@ def BCC_1354_full_AC(data,line_cont_list=[],
 
         for sub in tqdm(Bus):
 
-            res = create_OSP_substation_v65(data=data,substation=sub, cont_list=[sub,str(sub+'-1'),str(sub+'-2')]
-                                                ,Up_redispatch=Up_redispatch,Dn_redispatch=Dn_redispatch,Max_Sw_bus=Max_Sw_bus)
+            res = create_fixed_1354_substation_osp(data=data,substation=sub, cont_list=[sub,str(sub+'-1'),str(sub+'-2')]
+                                                ,Up_redispatch=Up_redispatch,Dn_redispatch=Dn_redispatch,Max_Sw_bus=Max_Sw_bus,
+                                                Vol0_li=Vol0_li,delta0_li=delta0_li)
             OSP_model = res['model']
             
 
 
             
-            result = solve_OSP_substation_v65(data=data,substation=sub, cont_list=[sub,str(sub+'-1'),str(sub+'-2')],TopologyMP=FinalTopology, model0=OSP_model)
+            result = solve_fixed_1354_substation_osp(data=data,substation=sub, cont_list=[sub,str(sub+'-1'),str(sub+'-2')],TopologyMP=FinalTopology, model0=OSP_model)
+            Vol0_li.update(result['Vol0_li'])
+            delta0_li.update(result['delta0_li'])
             
             OF_OSP_b[sub]=result['OF_OSP']
             OF_OSP+=OF_OSP_b[sub]
@@ -1400,12 +1458,14 @@ def BCC_1354_full_AC(data,line_cont_list=[],
         OF_OSP_c={}
         
         for c in tqdm(line_cont_list0):
-            # print('\tOSP line cont %3s'%c)
 
-            res = create_OSP_substation_v65(data=data,cont_list=[c],substation=Bus[0],Up_redispatch=Up_redispatch,Dn_redispatch=Dn_redispatch,Max_Sw_bus=Max_Sw_bus)
+            res = create_fixed_1354_substation_osp(data=data,cont_list=[c],substation=Bus[0],Up_redispatch=Up_redispatch,Dn_redispatch=Dn_redispatch,Max_Sw_bus=Max_Sw_bus,
+                                            Vol0_li=Vol0_li,delta0_li=delta0_li)
             OSP_model = res['model']
 
-            result=solve_OSP_substation_v65(data=data,model0=OSP_model, cont_list=[c],substation=Bus[0],TopologyMP=FinalTopology)
+            result=solve_fixed_1354_substation_osp(data=data,model0=OSP_model, cont_list=[c],substation=Bus[0],TopologyMP=FinalTopology)
+            Vol0_li.update(result['Vol0_li'])
+            delta0_li.update(result['delta0_li'])
             Mu[c]=result['Mu']
 
             OF_OSP_c[c]=result['OF_OSP']
@@ -1431,9 +1491,10 @@ def BCC_1354_full_AC(data,line_cont_list=[],
 
         solution_dict[k] = {'FinalTopology':FinalTopology,'Pg':PgMP,'Qg':QgMP,
                             'GenCost':GenCost.x,'TotalShedCost':OF_OSP,'ShedCost_df':ShedCost_df,
-                            'ShedCost_df':ShedCost_df,'PdShed_dc':PdShed_dc,
+                            'PdShed_dc':PdShed_dc,
                             'Cost_tot':UB,
-                            'time':tot_time,'time_iteration':time_iteration}
+                            'time':tot_time,'time_iteration':time_iteration,
+                            'Vol0_li':Vol0_li.copy(),'delta0_li':delta0_li.copy()}
 
 
         
@@ -1455,19 +1516,11 @@ def BCC_1354_full_AC(data,line_cont_list=[],
 
     
     
-    # plt.figure(figsize=(5,3))
-    # plt.plot(UB_k.keys(),UB_k.values(),marker='o')
-    # plt.plot(LB_k.keys(),LB_k.values(),marker='o')
-    # plt.legend(['UB','LB'],loc='best')
-    # #plt.xticks(range(k+1))
-    # plt.title('UB & LB')
-    # plt.show()
     
     
     
     
             
-#     display(FinalTopology)
             
             
             
@@ -1479,89 +1532,19 @@ def BCC_1354_full_AC(data,line_cont_list=[],
     
     
     
-    return { 'TopologyDict':solution_dict[k_min]['FinalTopology'],
-            'Pg':solution_dict[k_min]['Pg'],
-            # 'Qg':solution_dict[k_min]['Qg'],
-            'UB_k':UB_k,
-            'LB_k':LB_k,
-            'Cost_tot':solution_dict[k_min]['Cost_tot'],
+    return {
+        'TopologyDict':solution_dict[k_min]['FinalTopology'],
+        'Pg':solution_dict[k_min]['Pg'],
+        'UB_k':UB_k,
+        'LB_k':LB_k,
+        'Cost_tot':solution_dict[k_min]['Cost_tot'],
         'GenCost':solution_dict[k_min]['GenCost'],
         'TotalShedCost':solution_dict[k_min]['TotalShedCost'],
         'ShedCost_df':solution_dict[k_min]['ShedCost_df'],
-                        'PdShed_dc':solution_dict[k_min]['PdShed_dc'],
-             'time':tot_time,
-            'time_iteration':time_iteration,
+        'PdShed_dc':solution_dict[k_min]['PdShed_dc'],
+        'time':tot_time,
+        'time_iteration':time_iteration,
+        'Vol0_li':solution_dict[k_min]['Vol0_li'],
+        'delta0_li':solution_dict[k_min]['delta0_li'],
     }
-            
-        
-        
-        
-        
-        
-    
-    
-    
-    
-    
-
-# %%
-
-
-
-
-# %%
-# sys=14
-# lm=1
-# dem=1.0
-# sw=1
-# CaseStudies={}
-
-
-# data=read_data_AC(File='IEEE_14_bus_Data_PGLib_ACOPF.xlsx',DemFactor=1.0,LineLimit=1,print_data=False)
-
-# line_cont = [] #data['line_cont_notradial']
-# lc=len(line_cont)
-
-
-
-    
-# res = BCC_1354_full_AC(data,line_cont_list=line_cont,Max_Sw_bus=0,
-#                                    Max_iter=1,Max_FSP_iter=20,FSP_criteria=0)
-
-
-# # CaseStudies['full'] = res
-
-# # File_name = f'CaseStudy2_AC_full_{sys}bus_{sw}sw_{dem}dem_{lm}line_{lc}lc.pkl'
-
-# # with open(File_name, 'wb') as f:
-# #     pickle.dump(CaseStudies, f)
-
-
-# %%
-
-
-# %%
-# AllCaseStudies = {}
-
-# sys=1354
-# dem=1.0
-# sw=0
-# lm=1
-# lc=0
-
-# Models=['full','Proposed'] 
-
-# for model in Models:
-#     File_name = f'CaseStudy2_{model}_{sys}bus_{sw}sw_{dem}dem_{lm}line_{lc}lc.pkl'
-#     with open(File_name, 'rb') as f:
-#         AllCaseStudies[model] = pickle.load(f)[model]
-        
-# File_name = f'CaseStudy2_Allmodels_{sys}bus_{sw}sw_{dem}dem_{lm}line_{lc}lc.pkl'
-
-# with open(File_name, 'wb') as f:
-#     pickle.dump(AllCaseStudies, f)
-
-# %%
-
-
 

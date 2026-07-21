@@ -13,12 +13,75 @@ Research code accompanying:
 Substation reconfiguration through busbar splitting can relieve congestion and
 reduce operating cost. This implementation extends security-constrained
 reconfiguration to line, busbar, and coupler contingencies. It includes the
-paper's full formulation, heuristic multi-master problem (HMMP), optimality-cut
-variant, Benders baseline, and sequential/iterative heuristics.
+paper's full formulation, heuristic multi-master problem (HMMP), Benders
+baseline, and sequential/iterative heuristics.
+
+## Motivation
+
+On **January 8, 2021**, the European power system experienced a major
+disturbance that split the continental grid into two areas. The event was
+triggered by the **tripping of a highly loaded busbar coupler**, which led to
+cascading failures across the network.
+
+The post-event analysis showed that the **substation topology had not been
+adjusted after a transmission line outage**, and the **coupler contingency had
+not been included in the N-1 security analysis**.
+
+This incident highlights the importance of explicitly considering
+**substation elements such as busbars and couplers** when determining secure
+grid configurations.
+
+<p align="center">
+  <img src="figures/europe_grid_split.jpg" width="650" alt="European grid split">
+</p>
+
+*European system split on January 8, 2021 (adapted from the ENTSO-E report).*
 
 <p align="center">
   <img src="figures/substation_topology.jpg" width="500" alt="Substation topology">
 </p>
+
+*Illustration of the substation topology involved in the event.*
+
+To address this challenge, our work proposes a **security-constrained
+substation reconfiguration framework** that considers **line, coupler, and
+busbar contingencies**, while remaining computationally scalable for large
+power systems.
+
+## Abstract
+
+Substation reconfiguration via busbar splitting can mitigate transmission grid
+congestion and reduce operational costs. However, existing approaches neglect
+the security of substation topology, particularly for substations without
+busbar splitting (i.e., closed couplers), which can lead to severe
+consequences. Additionally, the computational complexity of optimizing
+substation topology remains a challenge.
+
+This paper introduces a MILP formulation for security-constrained substation
+reconfiguration (SC-SR), considering N-1 line, coupler, and busbar
+contingencies to ensure secure substation topology. To efficiently solve this
+problem, we propose a heuristic approach with multiple master problems (HMMP).
+A central master problem optimizes dispatch, while independent substation
+master problems determine individual substation topologies in parallel. Linear
+AC power flow equations ensure power-flow accuracy, while feasibility and
+optimality subproblems evaluate contingency cases.
+
+The proposed HMMP significantly reduces computational complexity and enables
+scalability to large power systems. Case studies on the IEEE 14-bus, IEEE
+118-bus, and PEGASE 1354-bus systems show the effectiveness of the approach in
+mitigating the impact of coupler and busbar tripping, balancing system security
+and cost, and improving computational efficiency.
+
+## Repository status
+
+The research implementation is available and is being prepared for its public
+release. The repository currently includes:
+
+- The proposed **SC-SR formulation** implemented in Python
+- The **heuristic multi-master problem** solution approach
+- Baseline approaches, including Benders decomposition variants and heuristic
+  methods
+- Case-study scripts for the IEEE benchmark systems
 
 ## Repository layout
 
@@ -26,7 +89,6 @@ variant, Benders baseline, and sequential/iterative heuristics.
 | --- | --- |
 | `sc_substation_reconfiguration/original_MIP_model.py` | Original monolithic MIP baseline, data reader, market dispatch, and AC SC-OPF |
 | `sc_substation_reconfiguration/hmmp.py` | Proposed heuristic multi-master method |
-| `sc_substation_reconfiguration/hmmp_optimality.py` | HMMP optimality-cut variant |
 | `sc_substation_reconfiguration/benders.py` | Classical Benders baseline |
 | `sc_substation_reconfiguration/iterative_heuristic.py` | Iterative heuristic |
 | `sc_substation_reconfiguration/sequential_heuristic.py` | Sequential heuristic |
@@ -57,8 +119,8 @@ expected sheets and source information are documented in
 
 ```python
 from sc_substation_reconfiguration.original_MIP_model import (
-    AC_SC_OPF_lp,
-    BCC_v60_AC_full,
+    solve_ac_sc_opf,
+    SC_SR_OrgMIP,
     read_data_AC,
 )
 
@@ -69,8 +131,8 @@ data = read_data_AC(
     busbar_prob=0.05,
 )
 
-market = AC_SC_OPF_lp(data=data, cont_list=[], print_result=False)
-result = BCC_v60_AC_full(
+market = solve_ac_sc_opf(data=data, cont_list=[], print_result=False)
+result = SC_SR_OrgMIP(
     data=data,
     cont_list=data["line_cont_notradial"] + data["busbar_cont"] + data["coupler_cont"],
     Pg_market=market["Pg"],
@@ -82,10 +144,12 @@ result = BCC_v60_AC_full(
 )
 ```
 
-The source files retain the original function names used in the experiments so
-results can be traced back to the paper. HPC scripts are archival research
-drivers; read [`experiments/hpc/README.md`](experiments/hpc/README.md) before
-running them because the job generators invoke `sbatch`.
+The public solver names follow the method labels used in the paper, including
+`SC_SR_OrgMIP`, `SC_SR_Benders`, `SC_SR_HMMP`, `SC_SR_1OptH`, and
+`SC_SR_SeqH`. Internal model builders and solvers include their owning method
+in the function name. HPC scripts are archival research drivers; read
+[`experiments/hpc/README.md`](experiments/hpc/README.md) before running them
+because the job generators invoke `sbatch`.
 
 ## Reproducibility notes
 
