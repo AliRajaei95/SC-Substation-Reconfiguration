@@ -98,8 +98,17 @@ release. The repository currently includes:
 
 ## Installation
 
-Python 3.10 or newer is recommended. Create an isolated environment and install
-the dependencies:
+Python 3.10 or newer is recommended. For a reproducible installation using the
+package versions tested for this release, create the Conda environment defined
+in [`environment.yml`](environment.yml):
+
+```bash
+conda env create -f environment.yml
+conda activate sc-substation-reconfiguration
+```
+
+Alternatively, create a virtual environment and install the compatible package
+ranges listed in [`requirements.txt`](requirements.txt):
 
 ```bash
 python -m venv .venv
