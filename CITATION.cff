@@ -1,0 +1,28 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the accompanying paper."
+title: "Security-Constrained Substation Reconfiguration"
+type: software
+authors:
+  - family-names: Rajaei
+    given-names: Ali
+    orcid: "https://orcid.org/0000-0002-8100-7018"
+  - family-names: Cremer
+    given-names: Jochen L.
+  - family-names: Arowolo
+    given-names: Olayiwola
+repository-code: "https://github.com/AliRajaei95/SC-Substation-Reconfiguration"
+license: MIT
+version: 1.0.0
+date-released: 2026-07-21
+preferred-citation:
+  type: article
+  title: "Security-Constrained Substation Reconfiguration Considering Busbar and Coupler Contingencies"
+  authors:
+    - family-names: Rajaei
+      given-names: Ali
+    - family-names: Arowolo
+      given-names: Olayiwola
+    - family-names: Cremer
+      given-names: Jochen L.
+  journal: "IEEE Transactions on Power Systems"
+  year: 2026

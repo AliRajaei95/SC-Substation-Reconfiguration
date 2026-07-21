@@ -1,80 +1,117 @@
-🚧 Code release in progress
 # Security-Constrained Substation Reconfiguration
 
-**Author:** Ali Rajaei  
-**Affiliation:** Delft-AI Energy Lab, Department of Electrical Sustainable Energy, Delft University of Technology, the Netherlands  
-**Contact:** a.rajaei@tudelft.nl  
-**Date:** April 2025  
+Research code accompanying:
 
-This repository accompanies the research paper:
-
-> Rajaei, Ali, Olayiwola Arowolo, and Jochen L. Cremer.  
-> ["Security-Constrained Substation Reconfiguration Considering Busbar and Coupler Contingencies."](https://arxiv.org/abs/2603.04203)  
+> Ali Rajaei, Olayiwola Arowolo, and Jochen L. Cremer, “Security-Constrained
+> Substation Reconfiguration Considering Busbar and Coupler Contingencies,”
 > *IEEE Transactions on Power Systems*, 2026.
 
----
+[Read the open-access preprint](https://arxiv.org/abs/2603.04203)
 
-## Motivation
+## Overview
 
-On **January 8, 2021**, the European power system experienced a major disturbance that split the continental grid into two areas.  
-The event was triggered by the **tripping of a highly loaded busbar coupler**, which led to cascading failures across the network.
-
-The post-event analysis showed that the **substation topology had not been adjusted after a transmission line outage**, and the **coupler contingency had not been included in the N-1 security analysis**.
-
-This incident highlights the importance of explicitly considering **substation elements such as busbars and couplers** when determining secure grid configurations.
-
-<p align="center">
-<img src="figures/europe_grid_split.jpg" width="650">
-</p>
-
-*European system split on January 8, 2021 (adapted from ENTSO-E report).*
+Substation reconfiguration through busbar splitting can relieve congestion and
+reduce operating cost. This implementation extends security-constrained
+reconfiguration to line, busbar, and coupler contingencies. It includes the
+paper's full formulation, heuristic multi-master problem (HMMP), optimality-cut
+variant, Benders baseline, and sequential/iterative heuristics.
 
 <p align="center">
-<img src="figures/substation_topology.jpg" width="500">
+  <img src="figures/substation_topology.jpg" width="500" alt="Substation topology">
 </p>
 
-*Illustration of the substation topology involved in the event.*
+## Repository layout
 
-To address this challenge, our work proposes a **security-constrained substation reconfiguration framework** that considers **line, coupler, and busbar contingencies**, while remaining computationally scalable for large power systems.
+| Path | Contents |
+| --- | --- |
+| `sc_substation_reconfiguration/original_MIP_model.py` | Original monolithic MIP baseline, data reader, market dispatch, and AC SC-OPF |
+| `sc_substation_reconfiguration/hmmp.py` | Proposed heuristic multi-master method |
+| `sc_substation_reconfiguration/hmmp_optimality.py` | HMMP optimality-cut variant |
+| `sc_substation_reconfiguration/benders.py` | Classical Benders baseline |
+| `sc_substation_reconfiguration/iterative_heuristic.py` | Iterative heuristic |
+| `sc_substation_reconfiguration/sequential_heuristic.py` | Sequential heuristic |
+| `sc_substation_reconfiguration/fixed_1354.py` | Fixed-topology PEGASE 1354-bus method |
+| `experiments/hpc/` | Slurm job generators and paper experiment scripts |
+| `data/` | Input-workbook format and data-source notes |
 
----
+## Installation
 
-## 📄 Abstract
+Python 3.10 or newer is recommended. Create an isolated environment and install
+the dependencies:
 
-Substation reconfiguration via busbar splitting can mitigate transmission grid congestion and reduce operational costs. However, existing approaches neglect the security of substation topology, particularly for substations without busbar splitting (i.e., closed couplers), which can lead to severe consequences. Additionally, the computational complexity of optimizing substation topology remains a challenge. 
+```bash
+python -m venv .venv
+source .venv/bin/activate  # Windows PowerShell: .venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+```
 
-This paper introduces a MILP formulation for security-constrained substation reconfiguration (SC-SR), considering N-1 line, coupler and busbar contingencies to ensure secure substation topology. To efficiently solve this problem, we propose a heuristic approach with multiple master problems (HMMP). A central master problem optimizes dispatch, while independent substation master problems determine individual substation topologies in parallel. Linear AC power flow equations ensure PF accuracy, while feasibility and optimality sub-problems evaluate contingency cases. 
+The models use the commercial [Gurobi Optimizer](https://www.gurobi.com/). A
+working Gurobi license is required; eligible academics can request a free
+academic license. The code used Gurobi 10.0.3 for the reported experiments.
 
-The proposed HMMP significantly reduces computational complexity and enables scalability to large-scale power systems. Case studies on the IEEE 14-bus, 118-bus, and PEGASE 1354-bus system show the effectiveness of the approach in mitigating the impact of coupler and busbar tripping, balancing system security and cost, and computational efficiency.
+## Data and basic use
 
----
+The original Excel benchmark workbooks are not redistributed here. Their
+expected sheets and source information are documented in
+[`data/README.md`](data/README.md). Once an input workbook is available:
 
-## Repository Status
+```python
+from sc_substation_reconfiguration.original_MIP_model import (
+    AC_SC_OPF_lp,
+    BCC_v60_AC_full,
+    read_data_AC,
+)
 
-🚧 **Code under preparation**
+data = read_data_AC(
+    File="data/IEEE_14_bus_Data_PGLib_ACOPF.xlsx",
+    DemFactor=1.0,
+    LineLimit=1.0,
+    busbar_prob=0.05,
+)
 
-The implementation used in the paper is currently being prepared for public release.  
-The repository will be updated soon with:
+market = AC_SC_OPF_lp(data=data, cont_list=[], print_result=False)
+result = BCC_v60_AC_full(
+    data=data,
+    cont_list=data["line_cont_notradial"] + data["busbar_cont"] + data["coupler_cont"],
+    Pg_market=market["Pg"],
+    FixedCost=True,
+    Probabilistic=True,
+    Max_Sw_bus=2,
+    SolverTime=3600,
+    print_result=True,
+)
+```
 
-- The proposed **SC-SR formulation** implemented in Python
-- The **heuristic multi-master problem** solution approach
-- Baseline solution approaches, including Bender decomposition variants, and heuristic methods
-- Case study scripts for the IEEE benchmark systems
+The source files retain the original function names used in the experiments so
+results can be traced back to the paper. HPC scripts are archival research
+drivers; read [`experiments/hpc/README.md`](experiments/hpc/README.md) before
+running them because the job generators invoke `sbatch`.
 
----
+## Reproducibility notes
+
+- Solver results can depend on the Gurobi version, license limits, machine, and
+  thread configuration.
+- Randomized routines should be given an explicit seed when comparing runs.
+- Generated jobs, logs, result pickles, and local PDF copies are intentionally
+  ignored by Git.
+- The open-access paper is linked above instead of bundling a potentially
+  publisher-restricted PDF.
 
 ## Citation
 
-If you use this work in your research, please cite:
+GitHub can export the citation metadata in [`CITATION.cff`](CITATION.cff). A
+BibTeX entry is also provided:
+
 ```bibtex
 @article{rajaei2026security,
-  title={Security-Constrained Substation Reconfiguration Considering Busbar and Coupler Contingencies},
-  author={Rajaei, Ali and Cremer, Jochen L},
-  journal={IEEE Transactions on Power Systems},
-  year={2026}
+  title   = {Security-Constrained Substation Reconfiguration Considering Busbar and Coupler Contingencies},
+  author  = {Rajaei, Ali and Arowolo, Olayiwola and Cremer, Jochen L.},
+  journal = {IEEE Transactions on Power Systems},
+  year    = {2026}
 }
 ```
 
 ## License
 
-This project will be released under the MIT License.
+The software is released under the [MIT License](LICENSE). Third-party
+benchmark data and the paper are governed by their respective licenses.

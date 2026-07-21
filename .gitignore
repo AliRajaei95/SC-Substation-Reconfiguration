@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.pkl
+*.log
+*.out
+.ipynb_checkpoints/
+.venv/
+venv/
+jobs/
+Results/
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store
+*.pdf
