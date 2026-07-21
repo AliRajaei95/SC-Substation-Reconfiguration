@@ -94,7 +94,7 @@ release. The repository currently includes:
 | `sc_substation_reconfiguration/sequential_heuristic.py` | Sequential heuristic |
 | `sc_substation_reconfiguration/fixed_1354.py` | Fixed-topology PEGASE 1354-bus method |
 | `experiments/hpc/` | Slurm job generators and paper experiment scripts |
-| `data/` | Input-workbook format and data-source notes |
+| `data/` | Included IEEE 14-bus, IEEE 118-bus, and PEGASE 1354-bus workbooks |
 
 ## Installation
 
@@ -113,9 +113,9 @@ academic license. The code used Gurobi 10.0.3 for the reported experiments.
 
 ## Data and basic use
 
-The original Excel benchmark workbooks are not redistributed here. Their
-expected sheets and source information are documented in
-[`data/README.md`](data/README.md). Once an input workbook is available:
+The repository includes the Excel workbooks used for the IEEE 14-bus, IEEE
+118-bus, and PEGASE 1354-bus case studies. Their format and source information
+are documented in [`data/README.md`](data/README.md). A basic example is:
 
 ```python
 from sc_substation_reconfiguration.original_MIP_model import (
@@ -151,15 +151,6 @@ in the function name. HPC scripts are archival research drivers; read
 [`experiments/hpc/README.md`](experiments/hpc/README.md) before running them
 because the job generators invoke `sbatch`.
 
-## Reproducibility notes
-
-- Solver results can depend on the Gurobi version, license limits, machine, and
-  thread configuration.
-- Randomized routines should be given an explicit seed when comparing runs.
-- Generated jobs, logs, result pickles, and local PDF copies are intentionally
-  ignored by Git.
-- The open-access paper is linked above instead of bundling a potentially
-  publisher-restricted PDF.
 
 ## Citation
 
