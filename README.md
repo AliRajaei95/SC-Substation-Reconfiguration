@@ -127,8 +127,7 @@ from sc_substation_reconfiguration.original_MIP_model import (
 data = read_data_AC(
     File="data/IEEE_14_bus_Data_PGLib_ACOPF.xlsx",
     DemFactor=1.0,
-    LineLimit=1.0,
-    busbar_prob=0.05,
+    LineLimit=1.0
 )
 
 market = solve_ac_sc_opf(data=data, cont_list=[], print_result=False)
@@ -136,9 +135,7 @@ result = SC_SR_OrgMIP(
     data=data,
     cont_list=data["line_cont_notradial"] + data["busbar_cont"] + data["coupler_cont"],
     Pg_market=market["Pg"],
-    FixedCost=True,
-    Probabilistic=True,
-    Max_Sw_bus=2,
+    Max_Sw_bus=1,
     SolverTime=3600,
     print_result=True,
 )
