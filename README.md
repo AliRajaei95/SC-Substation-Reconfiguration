@@ -32,7 +32,7 @@ This incident highlights the importance of explicitly considering
 grid configurations.
 
 <p align="center">
-  <img src="figures/europe_grid_split.jpg" width="650" alt="European grid split">
+  <img src="figures/europe_grid_split.png" width="650" alt="European grid split">
 </p>
 
 *European system split on January 8, 2021 (adapted from the ENTSO-E report).*
